@@ -83,15 +83,44 @@ claude mcp list
 > restarting, import `server.py` in a script and call the function directly,
 > bypassing the MCP layer.
 
-## The tool
+## The tools
 
-```
-delegate_to_kimi(task: str, file_paths: list[str] = [], extra_context: str = "")
-```
+Both report tokens in/out, how many were cache hits, and the estimated cost —
+so cache behaviour can be verified rather than assumed.
 
-Returns Kimi's proposed code as text, with a footer reporting tokens in/out,
-how many were cache hits, and the estimated cost — so cache behaviour can be
-verified rather than assumed.
+### `delegate_to_kimi(task, file_paths=[], extra_context="")`
+
+Returns Kimi's proposed code as text. Review it, then apply it yourself.
+
+Safer, but it has a cost trap: applying the code means re-emitting it through
+Write/Edit, so **the same code is billed twice** — once as Kimi output at
+$4/M, again as Claude output at $10/M. On a whole project that inversion can
+make delegating *more* expensive than not delegating at all.
+
+### `delegate_and_apply(task, base_dir, file_paths=[], extra_context="")`
+
+Writes the files itself and returns only a compact diff. Claude never
+re-emits the code, so the second charge disappears — **measured 82% lower
+Claude-side cost** on a small two-file task, and the gap widens on edits to
+large existing files, where the diff is far smaller than the file.
+
+The trade-off is real: review moves from *before* the write to *after* it.
+Use it on a clean git tree, and treat `git diff` / `git checkout` as the undo
+mechanism.
+
+The model's output is untrusted input — it chooses these paths — so every one
+is resolved and checked before anything is written:
+
+| Path from model | Result |
+|---|---|
+| `ok/file.py` | written |
+| `../escape.py` | refused — outside base_dir |
+| `/etc/passwd` | refused — absolute |
+| `~/x.py` | refused — absolute |
+| `.env`, `a/credentials.json` | refused — sensitive filename |
+
+The caller is also warned when `base_dir` isn't a git repo, or already had
+uncommitted changes that the write would get mixed into.
 
 ## Notes on model choice
 
