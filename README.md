@@ -156,6 +156,19 @@ resolved and checked before anything is written:
 | ANSI codes or markdown around the path | stripped, then checked |
 | empty after cleaning | refused — would resolve to `base_dir` itself |
 
+Subdirectories are fine at any depth — `tests/stubs/Arduino.h` is written, and
+missing parent directories are created. The check is not "does it contain
+`..`?" but "does the resolved path still land inside `base_dir`?", so a `..`
+that stays within (`src/sub/../other.py`) is allowed and one that escapes is
+not.
+
+> **Known limitation: symlinks pointing outside are refused.** Resolving a path
+> follows symlinks, so a `vendor/` inside the project that links to a library
+> above it lands outside `base_dir` and is rejected. That is deliberate — a
+> symlink would otherwise be the obvious way around the confinement — but it
+> also catches legitimate cases like linked monorepo packages. The clean fix is
+> to pass a `base_dir` high enough to contain both, not to loosen the check.
+
 ### `delegate_agentic(task, base_dir, extra_context="", max_turns=25)`
 
 Kimi gets four tools — `read_file`, `write_file`, `list_files` and `run_bash`
