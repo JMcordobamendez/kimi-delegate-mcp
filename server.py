@@ -27,6 +27,17 @@ BASE_URL = "https://api.moonshot.ai/v1"
 
 MAX_DIFF_LINES = 120
 
+# K2.7-code always thinks and cannot be told not to; those reasoning tokens are
+# billed as output AND count against this budget. Measured: 2314 of 3635
+# completion tokens (64%) were reasoning on a moderate task, so a budget sized
+# for the code alone truncates it. The API accepts at least 131072 here.
+MAX_OUTPUT_TOKENS = 32000
+
+# The model sometimes emits terminal colour codes around file paths, especially
+# under partial mode — '\x1b[1;34mapp.py\x1b[0m' would otherwise become a real
+# filename with escape bytes in it.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
 # Kimi caches by *prefix*: identical leading tokens are billed at $0.19/M
 # instead of $0.95/M. So everything stable must come first and the varying
 # task must come last, or the prefix diverges on the first request and
@@ -127,8 +138,17 @@ def _build_prompt(task: str, file_paths: list[str], extra_context: str) -> str:
     return "\n\n".join(parts)
 
 
-def _call_kimi(system_prompt: str, prompt: str) -> tuple[str, str]:
-    """Returns (message, usage footer)."""
+def _call_kimi(system_prompt: str, prompt: str) -> tuple[str, str, str]:
+    """Returns (message, usage footer, finish_reason).
+
+    Moonshot's partial mode (prefilling an assistant turn with "partial": true)
+    was tried here to force the FILE: format and skip the model's preamble. It
+    does cut output tokens by ~60% — because it suppresses thinking entirely —
+    but it also derails the model: it emitted empty code blocks with ANSI colour
+    codes where the path should be, then asked for the path it had just been
+    given. Not worth it; K2.7-code is a thinking model and works better left to
+    answer normally.
+    """
     client = _client()
     response = client.chat.completions.create(
         model=MODEL,
@@ -136,9 +156,10 @@ def _call_kimi(system_prompt: str, prompt: str) -> tuple[str, str]:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
-        max_completion_tokens=8000,
+        max_completion_tokens=MAX_OUTPUT_TOKENS,
     )
-    message = response.choices[0].message.content or ""
+    choice = response.choices[0]
+    message = choice.message.content or ""
 
     footer = ""
     usage = response.usage
@@ -147,15 +168,19 @@ def _call_kimi(system_prompt: str, prompt: str) -> tuple[str, str]:
         details = getattr(usage, "prompt_tokens_details", None)
         if details is not None:
             cached = getattr(details, "cached_tokens", 0) or 0
-        # Reported so cache behaviour can be verified rather than assumed.
+        ctd = getattr(usage, "completion_tokens_details", None)
+        reasoning = (getattr(ctd, "reasoning_tokens", 0) or 0) if ctd else 0
+        # Reported so cache behaviour and thinking overhead can be verified
+        # rather than assumed.
         billed_in = usage.prompt_tokens - cached
         cost = (billed_in * 0.95 + cached * 0.19 + usage.completion_tokens * 4.00) / 1e6
+        think = f", {reasoning} de razonamiento" if reasoning else ""
         footer = (
             f"_Kimi K2.7-code · {usage.prompt_tokens} tokens in "
-            f"({cached} cacheados) / {usage.completion_tokens} tokens out "
-            f"· ~${cost:.5f}_"
+            f"({cached} cacheados) / {usage.completion_tokens} tokens out"
+            f"{think} · ~${cost:.5f}_"
         )
-    return message, footer
+    return message, footer, choice.finish_reason or ""
 
 
 def _resolve_write_path(base: Path, raw: str) -> Path:
@@ -165,7 +190,12 @@ def _resolve_write_path(base: Path, raw: str) -> Path:
     every one is checked against the base directory after resolution (which
     collapses '..' and follows symlinks) before anything is written.
     """
-    rel = raw.strip().strip("`\"'")
+    rel = _ANSI_RE.sub("", raw).strip().strip("`\"'*").strip()
+    # A path that cleans down to nothing would resolve to base_dir itself and
+    # try to write over the directory. Seen for real: the model once emitted a
+    # bare ANSI reset code where the path belonged.
+    if not rel:
+        raise ValueError(f"ruta vacía tras limpiarla: {raw!r}")
     if rel.startswith("/") or rel.startswith("~"):
         raise ValueError(f"ruta absoluta rechazada: {rel}")
     target = (base / rel).resolve()
@@ -217,7 +247,12 @@ def delegate_to_kimi(task: str, file_paths: list[str] = [], extra_context: str =
         extra_context: contexto adicional en texto libre.
     """
     prompt = _build_prompt(task, file_paths, extra_context)
-    message, footer = _call_kimi(SYSTEM_PROMPT, prompt)
+    message, footer, finish = _call_kimi(SYSTEM_PROMPT, prompt)
+    if finish == "length":
+        message += (
+            "\n\n⚠️ **Respuesta truncada por límite de tokens** — está incompleta. "
+            "No la apliques tal cual; divide la tarea y reintenta."
+        )
     return f"{message}\n\n---\n{footer}" if footer else message
 
 
@@ -253,7 +288,19 @@ def delegate_and_apply(
     git_note = _git_note(base)
 
     prompt = _build_prompt(task, file_paths, extra_context)
-    message, footer = _call_kimi(SYSTEM_PROMPT_APPLY, prompt)
+    message, footer, finish = _call_kimi(SYSTEM_PROMPT_APPLY, prompt)
+
+    # A truncated reply silently loses whichever file was mid-generation: the
+    # regex needs a closing fence, so the last block just doesn't match and the
+    # run reports partial work as success. Refuse to write anything instead.
+    if finish == "length":
+        return (
+            "ABORTADO: la respuesta de Kimi se cortó por límite de tokens "
+            f"(finish_reason='length'), así que está incompleta. **No se ha escrito "
+            "nada** — aplicarla dejaría ficheros a medias o trabajo perdido en "
+            "silencio. Divide la tarea en partes más pequeñas y reintenta.\n\n"
+            f"---\n{footer}"
+        )
 
     blocks = list(_FILE_BLOCK_RE.finditer(message))
     if not blocks:
