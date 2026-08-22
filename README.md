@@ -1,97 +1,172 @@
 # kimi-delegate-mcp
 
-An MCP server that lets Claude Code delegate bounded coding tasks to
-[Kimi K2.7-code](https://platform.moonshot.ai) (Moonshot AI), while Claude stays
-the orchestrator and reviews every result.
+An MCP server that lets Claude Code delegate programming work to
+[Kimi K2.7-code](https://platform.moonshot.ai) (Moonshot AI) — from generating a
+single file to turning it loose as an autonomous agent that writes code, runs
+the tests and fixes itself — while Claude stays the orchestrator and decides
+what gets committed.
 
-Claude decides on its own when a task is worth delegating — repetitive work,
-writing code from a clear spec, mechanical refactors — calls Kimi as a tool,
-and reviews the proposed code before applying it.
+Three tools, three levels of trust, chosen per task:
 
-## Design
+| Tool | What it does | Kimi's reach |
+|---|---|---|
+| `delegate_to_kimi` | Returns proposed code as text | Nothing — text only |
+| `delegate_and_apply` | Writes the files, returns a diff | Writes inside one directory |
+| `delegate_agentic` | Explores, edits, runs tests, self-corrects in a loop | Shell, inside one project |
 
-**Kimi never touches your machine.** The server sends text (the task plus any
-file context Claude chose to pass) to the Moonshot API and returns text
-(proposed code). Applying changes is Claude's job, with its own Write/Edit
-tools, after review. That review gate is the whole point: cheap models are
-known to write tests that pass without testing anything, so nothing lands
-unreviewed.
+---
 
-Files whose names look sensitive (`.env`, `credentials`, `*.pem`, `*.key`, …)
-are refused before anything leaves the machine.
+## Requirements
 
-## Prefix-caching optimization
-
-Moonshot bills repeated prompt prefixes at $0.19/M instead of $0.95/M — an 80%
-discount on input. The caching is automatic (no `cache_id` to manage; the
-explicit `POST /v1/caching` API is legacy `moonshot-v1` only), but it only
-works if the prefix is actually stable:
-
-- The prompt must exceed **256 tokens** or nothing is cached.
-- Matching is **by prefix**, aligned to 256-token blocks. One changed byte and
-  everything after it stops being cached.
-
-So the prompt is built **stable first, variable last**:
-
-1. A fixed `system` message — byte-for-byte identical on every call.
-2. File context, with `sorted(file_paths)` so the same set of files always
-   produces the same prefix regardless of the order they were passed in.
-3. The task — the only part that varies — last.
-
-Getting this backwards (task first) means the prefix diverges on the first
-token and *nothing is ever cached*. Measured, two calls sharing a file context:
-
-| | Tokens in | Cached | Cost |
-|---|---|---|---|
-| Call 1 (cold) | 1,573 | 0 | $0.00184 |
-| Call 2 (same prefix) | 1,572 | **1,536 (98%)** | **$0.00065** |
-
-**65% cheaper on the second call.**
-
-Worth calibrating expectations: the discount applies to **input only**. On small
-one-off tasks the output dominates the bill (in one real delegation, 94% of the
-cost), so caching barely helps there. It pays off when you make several
-delegations over the same large file context.
+- **Python 3.10+**
+- **[Claude Code](https://claude.com/claude-code)**
+- **git** — the write-capable tools require a clean working tree, and use it as
+  the undo path
+- A **Moonshot API key** (pay-as-you-go; see below)
 
 ## Setup
 
+### 1. Get an API key
+
+Sign up at **[platform.kimi.ai](https://platform.kimi.ai)**, open **API Keys**,
+and create one. It is shown only once — copy it somewhere safe.
+
+Billing is pay-as-you-go: $0.95 per million input tokens ($0.19 cached), $4.00
+per million output. A small delegation costs well under a cent; the loops in
+`delegate_agentic` run to a few cents. A few dollars of credit goes a long way.
+
+> **Never put the key in this repository.** It is passed as an environment
+> variable at registration time (step 3) and stored in Claude Code's own
+> config, outside the repo. `.gitignore` already excludes `.env` and key files,
+> but the server never reads a key from disk in the first place — only from the
+> `MOONSHOT_API_KEY` environment variable.
+
+### 2. Install
+
 ```bash
-git clone https://github.com/JMcordobamendez/kimi-delegate-mcp.git
+git clone <this-repo-url>
 cd kimi-delegate-mcp
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-Get an API key from [platform.kimi.ai](https://platform.kimi.ai), then register
-the server with Claude Code:
+### 3. Register with Claude Code
+
+Use **absolute paths** — Claude Code launches this as a subprocess and does not
+resolve relative ones:
 
 ```bash
 claude mcp add kimi-delegate -s user \
-  -e MOONSHOT_API_KEY=sk-your-key-here \
-  -- /absolute/path/to/.venv/bin/python /absolute/path/to/server.py
+  -e MOONSHOT_API_KEY=your-key-here \
+  -- "$(pwd)/.venv/bin/python" "$(pwd)/server.py"
 ```
 
-Restart Claude Code, and check it connected:
+`-s user` makes it available in every project. Use `-s local` to limit it to
+the current one.
+
+### 4. Restart Claude Code, then verify
 
 ```bash
 claude mcp list
 ```
 
-> **Note:** Claude Code launches the MCP server as a subprocess at session
-> start. Changes to `server.py` or to the server's environment are **not**
-> picked up by a running session — restart it. To test changes without
-> restarting, import `server.py` in a script and call the function directly,
-> bypassing the MCP layer.
+You should see `kimi-delegate: ... - ✔ Connected`.
 
-## How a delegation flows
+> **The restart is not optional.** Claude Code starts MCP servers when the
+> session begins. A server registered mid-session does not appear — not even in
+> `/mcp` — and edits to `server.py` or to its environment are not picked up
+> until you restart. To test changes without restarting, import `server.py` in
+> a script and call the function directly, bypassing the MCP layer.
 
-Claude stays the orchestrator throughout: it decides what to delegate, builds
-the context, and reviews. The two tools differ in **who writes the file**, and
-that is where the cost is decided:
+---
+
+## The tools
+
+All three report tokens in/out, how many were cache hits, how many went to the
+model's reasoning, and the estimated cost:
+
+```
+_Kimi K2.7-code · 1572 tokens in (1536 cached) / 460 tokens out, 101 reasoning · ~$0.00065_
+```
+
+### `delegate_to_kimi(task, file_paths=[], extra_context="")`
+
+Returns Kimi's proposed code as text. Review it, then apply it yourself.
+
+Safest, but it has a cost trap: applying the code means re-emitting it through
+Write/Edit, so **the same code is billed twice** — once as Kimi output at $4/M,
+again as Claude output at $10/M. Over a whole project that inversion can make
+delegating *more* expensive than not delegating at all.
+
+### `delegate_and_apply(task, base_dir, file_paths=[], extra_context="")`
+
+Writes the files itself and returns only a compact diff. Claude never re-emits
+the code, so the second charge disappears — **measured 82% lower Claude-side
+cost** on a two-file task, and the gap widens on edits to large existing files.
+
+Review moves from *before* the write to *after* it. Use it on a clean git tree.
+
+The model's output is untrusted input — it chooses these paths — so every one is
+resolved and checked before anything is written:
+
+| Path from model | Result |
+|---|---|
+| `ok/file.py` | written |
+| `../escape.py` | refused — outside `base_dir` |
+| `/etc/passwd`, `~/x.py` | refused — absolute |
+| `.env`, `a/credentials.json` | refused — sensitive filename |
+| ANSI codes or markdown around the path | stripped, then checked |
+| empty after cleaning | refused — would resolve to `base_dir` itself |
+
+### `delegate_agentic(task, base_dir, extra_context="", max_turns=25)`
+
+Kimi gets four tools — `read_file`, `write_file`, `list_files` and `run_bash`
+(with `cwd` set to `base_dir`) — and runs its own loop: explore, edit, run the
+tests, see them fail, fix, repeat.
+
+This is what K2.7-code is actually built for; it scores above Opus 4.8 on
+tool-use benchmarks, and one-shot generation wastes that.
+
+State the finish condition in the task ("until `pytest` passes"), and give it a
+clean git tree.
+
+**Commits, pushes and publishing are refused** — those belong to the human and
+to Claude, not to a delegated agent. So are the git commands that would destroy
+the working tree the whole design relies on for undo:
+
+| Command | Result |
+|---|---|
+| `pytest -q`, `python -m pytest` | allowed |
+| `git status`, `git diff`, `git log` | allowed — read-only git |
+| `git commit`, `git push`, `gh pr create` | refused |
+| `ls && git push origin main` | refused — chained commands are caught |
+| `git reset --hard`, `git checkout`, `git clean` | refused |
+| `npm publish`, `twine upload` | refused |
+
+> ⚠️ **This is a workflow guard, not a sandbox.** `run_bash` takes a shell
+> string and the `cwd` confinement is a convenience, not a cage — a command can
+> leave the directory with an absolute path. It stops accidents, not attacks.
+> Only point it at projects where that is acceptable.
+
+Other limits: aborts unless the tree is clean, caps the loop at `max_turns`,
+times commands out at 120 s, clips tool output to 4,000 characters, and returns
+`git diff --stat` plus any new untracked files at the end.
+
+**Expect it to take liberties.** In testing it created a 28 MB virtualenv inside
+the project, unprompted, to install pytest after the system one was missing.
+That was reasonable and it got the tests passing — but review the directory, not
+just the diff.
+
+---
+
+## How it works
+
+The first two tools differ in **who writes the file**, and that is where the
+cost is decided:
 
 ```mermaid
 flowchart TD
-    T["Claude delegates<br/>a bounded task"] --> D{"Which tool?"}
+    T["Claude delegates"] --> D{"Which tool?"}
 
     D -->|delegate_to_kimi| A1["Kimi generates code<br/>output · 4 $/M"]
     A1 --> A2["Code enters Claude's<br/>context in full<br/>input · 2 $/M"]
@@ -100,18 +175,48 @@ flowchart TD
     A4 --> A5["File on disk"]
 
     D -->|delegate_and_apply| B1["Kimi generates code<br/>output · 4 $/M"]
-    B1 --> B2["MCP server validates<br/>paths and writes"]
+    B1 --> B2["Server validates<br/>paths and writes"]
     B2 --> B3["File on disk"]
     B3 --> B4["Claude receives only<br/>a compact diff<br/>input · 2 $/M"]
     B4 --> B5["Claude reviews<br/>AFTER the write<br/>git = undo"]
 ```
 
 The box that explains everything is **"Claude RE-EMITS the code"**: on the
-review-first path the same code is billed twice — once as Kimi output, again
-as Claude output at 2.5x the price. The direct-write path removes that second
-charge entirely.
+review-first path the same code is billed twice. The direct-write path removes
+the second charge entirely.
 
-### Prompt layout (and why the order matters)
+`delegate_agentic` works differently — a loop, not a reply:
+
+```mermaid
+flowchart TD
+    S["Claude starts delegate_agentic<br/>with a goal"] --> CHK{"clean git tree?"}
+    CHK -->|No| AB["Aborts, touching nothing"]
+    CHK -->|Yes| L["Kimi picks its next step"]
+    L --> TOOL{"which tool?"}
+    TOOL -->|read_file / list_files| R["Reads the project"]
+    TOOL -->|write_file| W["Writes files"]
+    TOOL -->|run_bash| G{"commit, push<br/>or publish?"}
+    G -->|Yes| DENY["REFUSED<br/>that is Claude's job"]
+    G -->|No| EXEC["Runs · cwd = base_dir"]
+    R --> L
+    W --> L
+    DENY --> L
+    EXEC --> L
+    L -->|stops asking for tools| DONE["Summary + git diff --stat<br/>back to Claude"]
+```
+
+### Prefix caching
+
+Moonshot bills repeated prompt prefixes at $0.19/M instead of $0.95/M — an 80%
+discount on input. Caching is automatic (no `cache_id` to manage; the explicit
+`POST /v1/caching` API is legacy `moonshot-v1` only), but it only works if the
+prefix is genuinely stable:
+
+- The prompt must exceed **256 tokens** or nothing is cached.
+- Matching is **by prefix**, aligned to 256-token blocks. One changed byte and
+  everything after it stops being cached.
+
+So the prompt is built **stable first, variable last**:
 
 ```mermaid
 flowchart TB
@@ -121,67 +226,71 @@ flowchart TB
     S --> F --> T --> R["Kimi responds"]
 ```
 
-Put the task first — as the original version did — and the prefix diverges on
-the third token, so nothing is ever cached.
+Put the task first and the prefix diverges on the third token, so nothing is
+ever cached. Measured, two calls sharing a file context:
 
-## The tools
+| | Tokens in | Cached | Cost |
+|---|---|---|---|
+| Call 1 (cold) | 1,573 | 0 | $0.00184 |
+| Call 2 (same prefix) | 1,572 | **1,536 (98%)** | **$0.00065** |
 
-Both report tokens in/out, how many were cache hits, and the estimated cost —
-so cache behaviour can be verified rather than assumed.
+The discount applies to **input only**. On small one-off tasks the output
+dominates the bill, so caching barely helps; it pays off across several
+delegations over the same large context.
 
-### `delegate_to_kimi(task, file_paths=[], extra_context="")`
+### Model behaviour worth knowing
 
-Returns Kimi's proposed code as text. Review it, then apply it yourself.
+Verified against the live API, not just the docs:
 
-Safer, but it has a cost trap: applying the code means re-emitting it through
-Write/Edit, so **the same code is billed twice** — once as Kimi output at
-$4/M, again as Claude output at $10/M. On a whole project that inversion can
-make delegating *more* expensive than not delegating at all.
+| | Reality | Consequence |
+|---|---|---|
+| Thinking | Always on, **cannot be disabled** | Billed as output and counts against `max_tokens` |
+| Temperature | **Ignored** — fixed sampling | Nothing to tune |
+| `reasoning_effort` | K3 only | Not applicable |
+| Output ceiling | Accepts ≥131,072 | The budget here is 32,000 |
 
-### `delegate_and_apply(task, base_dir, file_paths=[], extra_context="")`
+Reasoning is not a rounding error: on a moderate task it was **2,314 of 3,635
+completion tokens (64%)**. A budget sized for the code alone truncates it — and
+a truncated reply leaves its last file block unclosed, so a naive parser drops
+it silently. Both write-capable tools check `finish_reason` and refuse to apply
+a truncated reply.
 
-Writes the files itself and returns only a compact diff. Claude never
-re-emits the code, so the second charge disappears — **measured 82% lower
-Claude-side cost** on a small two-file task, and the gap widens on edits to
-large existing files, where the diff is far smaller than the file.
+Multi-turn tool loops must feed the assistant turn back **including
+`reasoning_content`**, or Moonshot rejects the following request.
 
-The trade-off is real: review moves from *before* the write to *after* it.
-Use it on a clean git tree, and treat `git diff` / `git checkout` as the undo
-mechanism.
-
-The model's output is untrusted input — it chooses these paths — so every one
-is resolved and checked before anything is written:
-
-| Path from model | Result |
-|---|---|
-| `ok/file.py` | written |
-| `../escape.py` | refused — outside base_dir |
-| `/etc/passwd` | refused — absolute |
-| `~/x.py` | refused — absolute |
-| `.env`, `a/credentials.json` | refused — sensitive filename |
-
-The caller is also warned when `base_dir` isn't a git repo, or already had
-uncommitted changes that the write would get mixed into.
+---
 
 ## Notes on model choice
 
 Kimi K2.7-code is the cheap-model pick here, not a claim that it beats better
 models. It doesn't: Sonnet 5 leads it on SWE-bench Verified (85.2% vs a
 self-reported 60.4%) and on SWE-bench Pro. K2.7's published gains over K2.6 come
-entirely from Moonshot's own benchmarks and have no independent verification —
-and its SWE-bench Verified score is actually *lower* than K2.6's.
+entirely from Moonshot's own benchmarks with no independent verification — and
+its SWE-bench Verified score is actually *lower* than K2.6's.
 
 What earns it the slot is that in independent testing K2.6 was the one cheap
 model that wrote tests that actually tested something, rather than mocking
 classes that don't exist. K2.7-code is its coding-specialist fine-tune. Treat
-its benchmark numbers as provisional; treat the review gate as mandatory.
+its benchmark numbers as provisional; treat review as mandatory.
 
 ## Data residency
 
 Moonshot does not specify a hosting country, and its policy permits training on
-submitted data with no documented opt-out. Don't send code covering third
-parties' personal data through this — under GDPR that's an international
-transfer to a country with no adequacy decision.
+submitted data with no documented opt-out. Everything the model reads leaves
+your machine irreversibly — and in agentic mode, *it* chooses what to read.
+
+Do not point this at code covering other people's personal data. Under GDPR that
+is an international transfer to a country with no adequacy decision.
+
+## Troubleshooting
+
+| Symptom | Cause |
+|---|---|
+| Tool doesn't appear in Claude Code | Server registered mid-session — restart Claude Code |
+| `MOONSHOT_API_KEY no está definida` | Key missing from the registration; re-run `claude mcp add` with `-e` |
+| Edits to `server.py` have no effect | The running session still has the old subprocess — restart |
+| `ABORTADO ... repo git limpio` | Uncommitted changes, often just `__pycache__`. Commit, stash, or gitignore them |
+| `ABORTADO: ... finish_reason='length'` | The task was too big for one reply. Split it up |
 
 ## License
 
