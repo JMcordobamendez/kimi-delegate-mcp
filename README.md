@@ -116,6 +116,10 @@ model's reasoning, and the estimated cost:
 _Kimi K2.7-code · 1572 tokens in (1536 cached) / 460 tokens out, 101 reasoning · ~$0.00065_
 ```
 
+`delegate_agentic` reports the same totals across the whole loop, with the cache
+hit rate as a percentage — the number worth watching there, since a loop resends
+its history on every turn.
+
 ### `delegate_to_kimi(task, file_paths=[], extra_context="")`
 
 Returns Kimi's proposed code as text. Review it, then apply it yourself.
@@ -175,9 +179,16 @@ the working tree the whole design relies on for undo:
 > leave the directory with an absolute path. It stops accidents, not attacks.
 > Only point it at projects where that is acceptable.
 
+Before the loop starts, the server probes the environment once — interpreter
+version, whether pytest is importable, any existing venv, project files, tests
+already present — and states it in the prompt, so the agent does not spend turns
+rediscovering it (see [Why loops cost more](#why-loops-cost-more) for what that
+buys).
+
 Other limits: aborts unless the tree is clean, caps the loop at `max_turns`,
-times commands out at 120 s, clips tool output to 4,000 characters, and returns
-`git diff --stat` plus any new untracked files at the end.
+times commands out at 120 s, clips tool output to 4,000 characters — keeping
+*both ends* for shell output, since test runners put the verdict on the last
+line — and returns `git diff --stat` plus any new untracked files at the end.
 
 **Expect it to take liberties.** In testing it created a 28 MB virtualenv inside
 the project, unprompted, to install pytest after the system one was missing.
@@ -264,6 +275,46 @@ ever cached. Measured, two calls sharing a file context:
 The discount applies to **input only**. On small one-off tasks the output
 dominates the bill, so caching barely helps; it pays off across several
 delegations over the same large context.
+
+### Why loops cost more
+
+The API is stateless: every call resends the whole conversation, so a loop's
+input grows each turn and the earliest tokens end up billed ten times over. A
+one-shot delegation runs about $0.003; an agentic loop runs $0.02–0.03. Not that
+the agent does ten times the work — there are just many more, and progressively
+larger, requests.
+
+Prefix caching is doing a lot of work here, because that repeated history is
+exactly what it is for. Measured on a real loop: **18,432 of 22,948 input tokens
+cached (80%)**, which took the run from $0.034 to $0.020 — a 41% saving.
+
+> **So do not trim the history to save money.** It is the obvious instinct and it
+> backfires: cutting from the middle changes the prefix, and everything after the
+> cut stops being cached.
+
+Where the money actually is, once caching is applied:
+
+| | Cost | Share |
+|---|---|---|
+| Input (80% cached) | $0.0078 | 39% |
+| Output | $0.0121 | **61%** |
+
+Output is the larger half and caching does not touch it. The only real lever
+left is **spending fewer turns** — each turn costs its own output (reasoning
+included) *and* then rides along in every later request. Hence the environment
+probe: on one run, four of eleven turns went on discovering that `python` was
+not on PATH, that pytest was missing, and building a virtualenv. Handing that
+over up front, on the same task:
+
+| | Before | After | |
+|---|---|---|---|
+| Tool calls | 11 | **8** | −27% |
+| Tokens in | 22,948 | 18,604 | −19% |
+| Tokens out | 3,035 | 2,291 | −25% |
+| Cost | $0.0199 | **$0.0161** | −19% |
+
+No loss of quality — 19 generated tests, all passing. The environment block sits
+ahead of the task so it stays inside the cacheable prefix.
 
 ### Model behaviour worth knowing
 
