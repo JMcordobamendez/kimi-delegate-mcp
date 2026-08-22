@@ -83,6 +83,47 @@ claude mcp list
 > restarting, import `server.py` in a script and call the function directly,
 > bypassing the MCP layer.
 
+## How a delegation flows
+
+Claude stays the orchestrator throughout: it decides what to delegate, builds
+the context, and reviews. The two tools differ in **who writes the file**, and
+that is where the cost is decided:
+
+```mermaid
+flowchart TD
+    T["Claude delegates<br/>a bounded task"] --> D{"Which tool?"}
+
+    D -->|delegate_to_kimi| A1["Kimi generates code<br/>output · 4 $/M"]
+    A1 --> A2["Code enters Claude's<br/>context in full<br/>input · 2 $/M"]
+    A2 --> A3["Claude reviews<br/>BEFORE any write"]
+    A3 --> A4["Claude RE-EMITS the code<br/>via Write / Edit<br/>output · 10 $/M"]
+    A4 --> A5["File on disk"]
+
+    D -->|delegate_and_apply| B1["Kimi generates code<br/>output · 4 $/M"]
+    B1 --> B2["MCP server validates<br/>paths and writes"]
+    B2 --> B3["File on disk"]
+    B3 --> B4["Claude receives only<br/>a compact diff<br/>input · 2 $/M"]
+    B4 --> B5["Claude reviews<br/>AFTER the write<br/>git = undo"]
+```
+
+The box that explains everything is **"Claude RE-EMITS the code"**: on the
+review-first path the same code is billed twice — once as Kimi output, again
+as Claude output at 2.5x the price. The direct-write path removes that second
+charge entirely.
+
+### Prompt layout (and why the order matters)
+
+```mermaid
+flowchart TB
+    S["1 · SYSTEM_PROMPT<br/>byte-for-byte identical every call<br/>cached almost always"]
+    F["2 · File context<br/>sorted, so the order is stable<br/>cached when the same files repeat"]
+    T["3 · The task<br/>different every call<br/>never cached"]
+    S --> F --> T --> R["Kimi responds"]
+```
+
+Put the task first — as the original version did — and the prefix diverges on
+the third token, so nothing is ever cached.
+
 ## The tools
 
 Both report tokens in/out, how many were cache hits, and the estimated cost —
