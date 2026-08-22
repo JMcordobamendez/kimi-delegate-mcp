@@ -39,6 +39,18 @@ MAX_OUTPUT_TOKENS = 32000
 # filename with escape bytes in it.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
+# The delegated model marking its own homework is the known weak spot of this
+# whole design: cheap models write tests that pass without testing anything. So
+# every mode asks for code that someone *else* can test independently — seams
+# to inject at, no hidden state — rather than trusting the tests it wrote.
+TESTABILITY_RULE = (
+    "Deja el código preparado para que otra persona pueda testearlo por su "
+    "cuenta: funciones puras siempre que se pueda, y los efectos secundarios "
+    "(red, disco, hora actual, aleatoriedad, subprocesos) aislados detrás de "
+    "parámetros inyectables en lugar de incrustados en la lógica. Nada de "
+    "estado global oculto ni de dependencias imposibles de sustituir."
+)
+
 # Kimi caches by *prefix*: identical leading tokens are billed at $0.19/M
 # instead of $0.95/M. So everything stable must come first and the varying
 # task must come last, or the prefix diverges on the first request and
@@ -49,7 +61,8 @@ SYSTEM_PROMPT = (
     "Devuelve el código completo de cada fichero que cambies o crees, cada "
     "uno en su propio bloque de código con la ruta como cabecera antes del "
     "bloque. No hay forma de que ejecutes nada en el sistema del usuario: "
-    "limítate a proponer texto/código, no asumas acceso a herramientas."
+    "limítate a proponer texto/código, no asumas acceso a herramientas.\n\n"
+    + TESTABILITY_RULE
 )
 
 SYSTEM_PROMPT_APPLY = (
@@ -63,7 +76,8 @@ SYSTEM_PROMPT_APPLY = (
     "ni elipsis: lo que emitas sustituye al fichero entero.\n\n"
     "Las rutas son siempre relativas al directorio de trabajo. No uses rutas "
     "absolutas ni '..'. No emitas texto fuera de ese formato, salvo como mucho "
-    "una línea final de resumen."
+    "una línea final de resumen.\n\n"
+    + TESTABILITY_RULE
 )
 
 SENSITIVE_NAME_HINTS = (
@@ -379,8 +393,19 @@ SYSTEM_PROMPT_AGENTIC = (
     "No hagas commits ni push, ni publiques nada: de eso se encarga Claude con "
     "el visto bueno del usuario. Tampoco uses git para descartar o reescribir "
     "cambios. Deja tu trabajo en el árbol de trabajo tal cual.\n\n"
-    "Cuando hayas terminado y verificado, responde con un resumen breve en "
-    "texto plano y sin llamar a más herramientas."
+    + TESTABILITY_RULE
+    + "\n\nAdemás, deja la infraestructura de tests montada y funcionando "
+    "aunque la tarea no la pidiera: el runner configurado y, si hace falta, un "
+    "conftest.py con fixtures para lo externo (red, disco, reloj). La idea es "
+    "que quien venga detrás pueda escribir un test suyo y ejecutarlo sin "
+    "montar nada.\n\n"
+    "Tu resumen final debe incluir, sí o sí:\n"
+    "1. El comando EXACTO para ejecutar los tests, tal y como funciona en este "
+    "proyecto (con la ruta del intérprete si has usado un venv).\n"
+    "2. Qué fixtures o puntos de inyección has dejado disponibles.\n"
+    "3. Qué ha quedado difícil de testear y por qué.\n\n"
+    "Cuando hayas terminado y verificado, responde con ese resumen en texto "
+    "plano y sin llamar a más herramientas."
 )
 
 AGENTIC_TOOLS = [
