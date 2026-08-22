@@ -486,10 +486,47 @@ _FORBIDDEN_CMD_RE = re.compile(
 )
 
 
-def _clip(text: str) -> str:
+def _clip(text: str, keep_tail: bool = False) -> str:
     if len(text) <= MAX_TOOL_OUTPUT:
         return text
+    if keep_tail:
+        # Test runners and compilers put the verdict at the *end*. Keeping only
+        # the head would cut off the one line the agent actually needs.
+        head = MAX_TOOL_OUTPUT // 2
+        tail = MAX_TOOL_OUTPUT - head
+        cut = len(text) - MAX_TOOL_OUTPUT
+        return f"{text[:head]}\n... [recortado {cut} chars del medio] ...\n{text[-tail:]}"
     return text[:MAX_TOOL_OUTPUT] + f"\n... [recortado, {len(text) - MAX_TOOL_OUTPUT} chars más]"
+
+
+def _probe_environment(base: Path) -> str:
+    """Tell the agent what it is working with before it starts guessing.
+
+    Turns are the expensive unit in a loop: each one costs its own output
+    (reasoning included) and then rides along in every later request. In one
+    run, four of eleven turns went on discovering that `python` was not on
+    PATH, that pytest was missing, and building a virtualenv. Handing that over
+    up front buys back those turns.
+    """
+    def sh(cmd: str) -> str:
+        try:
+            r = subprocess.run(
+                cmd, shell=True, cwd=str(base),
+                capture_output=True, text=True, timeout=20,
+            )
+            out = (r.stdout or r.stderr).strip()
+            return out.splitlines()[0] if out else "no"
+        except Exception:
+            return "no se pudo comprobar"
+
+    return (
+        "Entorno ya comprobado (no gastes turnos en redescubrirlo):\n"
+        f"- intérprete: {sh('python3 --version')}\n"
+        f"- pytest ya instalado: {sh('python3 -m pytest --version 2>&1 | head -1')}\n"
+        f"- venv existente en el proyecto: {sh('ls -d venv .venv 2>/dev/null | head -1')}\n"
+        f"- ficheros de proyecto: {sh('ls requirements*.txt pyproject.toml setup.py package.json Makefile 2>/dev/null | tr \"\\n\" \" \"')}\n"
+        f"- tests que ya existen: {sh('ls test_*.py *_test.py tests 2>/dev/null | head -5 | tr \"\\n\" \" \"')}"
+    )
 
 
 def _run_agentic_tool(base: Path, name: str, args: dict) -> str:
@@ -529,7 +566,7 @@ def _run_agentic_tool(base: Path, name: str, args: dict) -> str:
                 capture_output=True, text=True, timeout=BASH_TIMEOUT,
             )
             out = (r.stdout or "") + (("\n[stderr]\n" + r.stderr) if r.stderr else "")
-            return _clip(f"[exit {r.returncode}]\n{out}".strip())
+            return _clip(f"[exit {r.returncode}]\n{out}".strip(), keep_tail=True)
 
         return f"ERROR: herramienta desconocida {name}"
     except subprocess.TimeoutExpired:
@@ -579,14 +616,20 @@ def delegate_agentic(
             "Commitea o descarta lo que tengas pendiente y reintenta."
         )
 
+    # Stable-first ordering again: the environment block is the same across
+    # delegations into the same project, so it sits ahead of the varying task
+    # and stays inside the cacheable prefix.
+    env_block = _probe_environment(base)
+    context = f"{env_block}\n\n{extra_context}" if extra_context else env_block
+
     client = _client()
     messages: list[dict] = [
         {"role": "system", "content": SYSTEM_PROMPT_AGENTIC},
-        {"role": "user", "content": _build_prompt(task, [], extra_context)},
+        {"role": "user", "content": _build_prompt(task, [], context)},
     ]
 
     total_cost = 0.0
-    total_in = total_out = 0
+    total_in = total_out = total_cached = 0
     log: list[str] = []
     final = ""
 
@@ -610,6 +653,7 @@ def delegate_agentic(
             ) / 1e6
             total_in += u.prompt_tokens
             total_out += u.completion_tokens
+            total_cached += cached
 
         # The assistant turn must go back verbatim — including reasoning_content,
         # which Moonshot rejects the next request without. Dropping it is the
@@ -660,8 +704,11 @@ def delegate_agentic(
     out += [
         "",
         "---",
-        f"_Kimi K2.7-code · {total_in} tokens in / {total_out} out en "
-        f"{len(log)} llamadas · ~${total_cost:.5f}_",
+        # Cache hits matter most here: every turn resends the whole history, so
+        # the repeated prefix is the bulk of what is billed.
+        f"_Kimi K2.7-code · {total_in} tokens in ({total_cached} cacheados, "
+        f"{100 * total_cached // max(total_in, 1)}%) / {total_out} out "
+        f"en {len(log)} llamadas · ~${total_cost:.5f}_",
     ]
     return "\n".join(out)
 
