@@ -82,6 +82,33 @@ You should see `kimi-delegate: ... - ✔ Connected`.
 
 ## The tools
 
+### Code you can verify yourself
+
+A delegated model that finishes when its own tests go green is marking its own
+homework — and cheap models are known to write tests that pass without testing
+anything. So all three modes require **injectable seams** rather than trusted
+tests: pure functions where possible, side effects (network, disk, clock,
+randomness) behind parameters instead of buried in the logic, no hidden global
+state.
+
+`delegate_agentic` also leaves the test infrastructure standing and must report
+the exact command to run the tests, the seams it left, and what stayed hard to
+test.
+
+Verified on a task with real side effects — "fetch the weather for a city and
+report it with a timestamp". It produced:
+
+```python
+def report(city: str, *, fetch=None, now=None) -> str:
+```
+
+plus a `conftest.py` with a fake-HTTP factory and a frozen clock. Six
+independently written tests — covering cases it had *not* anticipated, such as
+the `results` key being absent rather than empty, and URL-encoding of accented
+city names — all passed against those seams, without touching its code.
+
+### Reporting
+
 All three report tokens in/out, how many were cache hits, how many went to the
 model's reasoning, and the estimated cost:
 
