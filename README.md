@@ -13,6 +13,7 @@ Three tools, three levels of trust, chosen per task:
 | `delegate_to_kimi` | Returns proposed code as text | Nothing — text only |
 | `delegate_and_apply` | Writes the files, returns a diff | Writes inside one directory |
 | `delegate_agentic` | Explores, edits, runs tests, self-corrects in a loop | Shell, inside one project |
+| `resume_delegation` | Answers a paused agent and resumes it | — it is how *you* reply |
 
 ---
 
@@ -107,6 +108,12 @@ independently written tests — covering cases it had *not* anticipated, such as
 the `results` key being absent rather than empty, and URL-encoding of accented
 city names — all passed against those seams, without touching its code.
 
+It holds up where it matters most, too. Given an ESP32 blink-in-morse task with
+no board attached, it pulled the logic into a `MorsePlayer<IO>` template with
+the I/O injected, stubbed the Arduino API, and left five host-side tests —
+timing assertions included — that run on a development machine with no hardware
+present. For embedded work that is the difference between testable and not.
+
 ### Reporting
 
 All three report tokens in/out, how many were cache hits, how many went to the
@@ -194,6 +201,50 @@ line — and returns `git diff --stat` plus any new untracked files at the end.
 the project, unprompted, to install pytest after the system one was missing.
 That was reasonable and it got the tests passing — but review the directory, not
 just the diff.
+
+### `resume_delegation(session_id, result)`
+
+Confined to one directory and barred from committing, the agent would otherwise
+have no way to handle work that needs the outside world — flashing a board,
+reading a serial port, someone looking at an LED. It would only be able to give
+up or invent a result.
+
+So it gets a fifth tool of its own, `ask_claude`. Calling it **suspends the
+loop**: state is written to `~/.cache/kimi-delegate/sessions/`, and the request
+comes back to you along with the work so far and the diff. Do the thing, then
+call `resume_delegation` with what you observed — the same session continues
+with its context intact.
+
+```mermaid
+flowchart TD
+    K["Agent working"] --> N{"needs something<br/>out of reach?"}
+    N -->|No| K
+    N -->|Yes| ASK["ask_claude('flash it and<br/>tell me what the LED does')"]
+    ASK --> SAVE["State saved to ~/.cache<br/>under a session_id"]
+    SAVE --> C["You get the request<br/>+ work log + git diff"]
+    C --> DO["You do it<br/>asking a human if it is hardware,<br/>credentials, or irreversible"]
+    DO --> RES["resume_delegation(session_id, result)"]
+    RES --> K
+```
+
+Note that the agent does not gain any reach here — it gains a way to *ask*. You
+stay the gate.
+
+Be literal in `result`: paste the real output, or describe exactly what is
+visible. Saying you *couldn't* do it is also a useful answer — it lets the agent
+try another route instead of waiting.
+
+> **Answer carefully, and check the work log first.** Given a report that
+> contradicts its own correct code, this model does not push back — it
+> improvises. In testing, a deliberately false observation ("dots and dashes
+> look the same length") had it "fixing" the LED polarity, which has nothing to
+> do with duration, on code whose timings were already correct *and* covered by
+> a passing test it had written. If your answer contradicts what it has built,
+> say so explicitly rather than letting it guess.
+
+Session ids are generated server-side and validated on the way back in, since
+they return as an argument. Sessions expire after 24 hours, and the saved file
+is removed on resume so the same pause cannot be answered twice.
 
 ---
 
@@ -316,6 +367,10 @@ over up front, on the same task:
 No loss of quality — 19 generated tests, all passing. The environment block sits
 ahead of the task so it stays inside the cacheable prefix.
 
+Runs that pause and resume are the expensive case: each resume restarts from the
+whole accumulated history. The ESP32 session above reached **$0.127 over 24
+calls** — still small change, but roughly six times a straightforward loop.
+
 ### Model behaviour worth knowing
 
 Verified against the live API, not just the docs:
@@ -369,6 +424,7 @@ is an international transfer to a country with no adequacy decision.
 | Edits to `server.py` have no effect | The running session still has the old subprocess — restart |
 | `ABORTADO ... repo git limpio` | Uncommitted changes, often just `__pycache__`. Commit, stash, or gitignore them |
 | `ABORTADO: ... finish_reason='length'` | The task was too big for one reply. Split it up |
+| `No hay ninguna delegación pausada con id ...` | The session expired (24 h) or was already resumed. Start a fresh delegation |
 
 ## License
 
