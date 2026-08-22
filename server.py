@@ -13,6 +13,7 @@ Two tools, with different cost/safety trade-offs:
   Review moves from before-the-write to after-the-write, so it wants a git
   working tree underneath as the undo mechanism.
 """
+import json
 import os
 import re
 import subprocess
@@ -363,6 +364,280 @@ def delegate_and_apply(
 
     if footer:
         out += ["", "---", footer]
+    return "\n".join(out)
+
+
+SYSTEM_PROMPT_AGENTIC = (
+    "Eres un agente de programación trabajando dentro de un proyecto. Tienes "
+    "herramientas para leer, escribir y listar ficheros, y para ejecutar "
+    "comandos de shell. El directorio de trabajo ya está fijado en la raíz del "
+    "proyecto: usa siempre rutas relativas.\n\n"
+    "Método de trabajo: explora lo que necesites, haz los cambios, y "
+    "**verifica ejecutando los tests o el comando que corresponda**. Si algo "
+    "falla, corrígelo y vuelve a ejecutarlo. No des la tarea por terminada sin "
+    "haberla comprobado de verdad.\n\n"
+    "No hagas commits ni push, ni publiques nada: de eso se encarga Claude con "
+    "el visto bueno del usuario. Tampoco uses git para descartar o reescribir "
+    "cambios. Deja tu trabajo en el árbol de trabajo tal cual.\n\n"
+    "Cuando hayas terminado y verificado, responde con un resumen breve en "
+    "texto plano y sin llamar a más herramientas."
+)
+
+AGENTIC_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Lee un fichero del proyecto. Ruta relativa a la raíz.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Escribe (crea o reemplaza) un fichero. Ruta relativa a la raíz.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "Lista ficheros del proyecto que casan con un glob, p.ej. '**/*.py'.",
+            "parameters": {
+                "type": "object",
+                "properties": {"pattern": {"type": "string"}},
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_bash",
+            "description": (
+                "Ejecuta un comando de shell con el directorio de trabajo en la "
+                "raíz del proyecto. Úsalo sobre todo para ejecutar los tests."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    },
+]
+
+MAX_TOOL_OUTPUT = 4000
+BASH_TIMEOUT = 120
+
+# Commits, pushes and anything that publishes stay with Claude, done with the
+# user's approval — never the delegated agent. Also refused: the git commands
+# that would destroy the working tree this design relies on as its undo path.
+# Read-only git (status, diff, log, ls-files) stays available.
+#
+# This is a workflow guard over a cooperative model, not a security boundary:
+# run_bash takes a shell string, so a determined model could word its way past
+# it. It exists to stop accidents, not attacks.
+_FORBIDDEN_CMD_RE = re.compile(
+    r"\bgit\s+(commit|push|tag|reset|rebase|merge|stash|clean|checkout|restore)\b"
+    r"|\bgh\s+"
+    r"|\b(npm|pnpm|yarn)\s+publish\b"
+    r"|\btwine\s+upload\b"
+    r"|\b(poetry|cargo)\s+publish\b",
+    re.IGNORECASE,
+)
+
+
+def _clip(text: str) -> str:
+    if len(text) <= MAX_TOOL_OUTPUT:
+        return text
+    return text[:MAX_TOOL_OUTPUT] + f"\n... [recortado, {len(text) - MAX_TOOL_OUTPUT} chars más]"
+
+
+def _run_agentic_tool(base: Path, name: str, args: dict) -> str:
+    """Execute one tool call. Never raises: the model needs to see failures."""
+    try:
+        if name == "read_file":
+            p = _resolve_write_path(base, args["path"])
+            if not p.is_file():
+                return f"ERROR: no existe {args['path']}"
+            return _clip(p.read_text(errors="replace"))
+
+        if name == "write_file":
+            p = _resolve_write_path(base, args["path"])
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(args["content"])
+            return f"OK: escrito {p.relative_to(base)} ({len(args['content'].splitlines())} líneas)"
+
+        if name == "list_files":
+            pattern = args.get("pattern", "**/*")
+            hits = [
+                str(f.relative_to(base))
+                for f in sorted(base.glob(pattern))
+                if f.is_file() and ".git/" not in str(f)
+            ]
+            return _clip("\n".join(hits[:200]) or "(sin resultados)")
+
+        if name == "run_bash":
+            if _FORBIDDEN_CMD_RE.search(args["command"]):
+                return (
+                    "RECHAZADO: los commits, los push y cualquier publicación los "
+                    "hace Claude con el visto bueno del usuario, no tú. Tampoco "
+                    "puedes usar git para descartar o reescribir cambios. Deja el "
+                    "trabajo en el árbol y descríbelo en tu resumen final."
+                )
+            r = subprocess.run(
+                args["command"], shell=True, cwd=str(base),
+                capture_output=True, text=True, timeout=BASH_TIMEOUT,
+            )
+            out = (r.stdout or "") + (("\n[stderr]\n" + r.stderr) if r.stderr else "")
+            return _clip(f"[exit {r.returncode}]\n{out}".strip())
+
+        return f"ERROR: herramienta desconocida {name}"
+    except subprocess.TimeoutExpired:
+        return f"ERROR: el comando excedió {BASH_TIMEOUT}s y se abortó"
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {e}"
+
+
+@mcp.tool()
+def delegate_agentic(
+    task: str,
+    base_dir: str,
+    extra_context: str = "",
+    max_turns: int = 25,
+) -> str:
+    """Lanza a Kimi como **agente autónomo** dentro de un proyecto, con shell.
+
+    A diferencia de las otras dos herramientas, aquí Kimi no da una respuesta y
+    para: explora el proyecto, edita, **ejecuta los tests, ve si fallan y se
+    corrige**, en bucle, hasta terminar. Es lo que mejor aprovecha a K2.7-code,
+    que está afinado para uso agéntico de herramientas.
+
+    Requiere un repo git limpio: git es el mecanismo de deshacer, y al terminar
+    se devuelve el `git diff --stat` de lo que haya tocado.
+
+    ⚠️ Kimi ejecuta comandos de shell reales. El directorio de trabajo se fija
+    a `base_dir`, pero un comando puede salirse de ahí con rutas absolutas: el
+    confinamiento es de conveniencia, no una jaula. Todo lo que lea se envía a
+    Moonshot. No usar en proyectos con datos de terceros (RGPD).
+
+    Args:
+        task: el objetivo, con su criterio de "terminado" (p.ej. "que pase pytest").
+        base_dir: raíz del proyecto. Debe ser un repo git sin cambios pendientes.
+        extra_context: contexto adicional en texto libre.
+        max_turns: tope de iteraciones, para que un bucle no se desboque.
+    """
+    base = Path(base_dir).expanduser().resolve()
+    if not base.is_dir():
+        return f"ERROR: base_dir no existe o no es un directorio: {base}"
+
+    note = _git_note(base)
+    if note:
+        return (
+            f"ABORTADO antes de empezar: {note}\n\n"
+            "El modo agéntico ejecuta comandos y edita ficheros sin revisión "
+            "intermedia, así que exige un repo git limpio para poder deshacer. "
+            "Commitea o descarta lo que tengas pendiente y reintenta."
+        )
+
+    client = _client()
+    messages: list[dict] = [
+        {"role": "system", "content": SYSTEM_PROMPT_AGENTIC},
+        {"role": "user", "content": _build_prompt(task, [], extra_context)},
+    ]
+
+    total_cost = 0.0
+    total_in = total_out = 0
+    log: list[str] = []
+    final = ""
+
+    for turn in range(1, max_turns + 1):
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            tools=AGENTIC_TOOLS,
+            tool_choice="auto",
+            max_completion_tokens=MAX_OUTPUT_TOKENS,
+        )
+        choice = resp.choices[0]
+        msg = choice.message
+
+        u = resp.usage
+        if u:
+            ptd = getattr(u, "prompt_tokens_details", None)
+            cached = (getattr(ptd, "cached_tokens", 0) or 0) if ptd else 0
+            total_cost += (
+                (u.prompt_tokens - cached) * 0.95 + cached * 0.19 + u.completion_tokens * 4.00
+            ) / 1e6
+            total_in += u.prompt_tokens
+            total_out += u.completion_tokens
+
+        # The assistant turn must go back verbatim — including reasoning_content,
+        # which Moonshot rejects the next request without. Dropping it is the
+        # exact bug that makes some thinking models unusable in tool loops.
+        messages.append(msg.model_dump(exclude_none=True))
+
+        if not msg.tool_calls:
+            final = msg.content or ""
+            break
+
+        for tc in msg.tool_calls:
+            name = tc.function.name
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError as e:
+                result = f"ERROR: argumentos JSON inválidos: {e}"
+                args = {}
+            else:
+                result = _run_agentic_tool(base, name, args)
+
+            detail = args.get("command") or args.get("path") or args.get("pattern") or ""
+            log.append(f"  {turn:>2}. {name}({detail[:70]})")
+            messages.append(
+                {"role": "tool", "tool_call_id": tc.id, "content": result}
+            )
+    else:
+        final = f"(sin terminar: alcanzado el tope de {max_turns} turnos)"
+
+    try:
+        diff = subprocess.run(
+            ["git", "-C", str(base), "diff", "--stat"],
+            capture_output=True, text=True, timeout=15,
+        ).stdout.strip()
+        untracked = subprocess.run(
+            ["git", "-C", str(base), "ls-files", "--others", "--exclude-standard"],
+            capture_output=True, text=True, timeout=15,
+        ).stdout.strip()
+    except Exception:
+        diff = untracked = ""
+
+    out = [f"Kimi trabajó en {base} — {len(log)} llamadas a herramientas:", *log]
+    if final:
+        out += ["", "Resumen de Kimi:", final]
+    if diff:
+        out += ["", "git diff --stat:", diff]
+    if untracked:
+        out += ["", "Ficheros nuevos sin trackear:", untracked]
+    out += [
+        "",
+        "---",
+        f"_Kimi K2.7-code · {total_in} tokens in / {total_out} out en "
+        f"{len(log)} llamadas · ~${total_cost:.5f}_",
+    ]
     return "\n".join(out)
 
 
