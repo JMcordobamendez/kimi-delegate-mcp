@@ -17,6 +17,8 @@ import json
 import os
 import re
 import subprocess
+import time
+import uuid
 from difflib import unified_diff
 from pathlib import Path
 
@@ -221,6 +223,22 @@ def _resolve_write_path(base: Path, raw: str) -> Path:
     return target
 
 
+def _git_summary(base: Path) -> tuple[str, str]:
+    """Return (diff --stat, untracked files) for reporting what changed."""
+    try:
+        diff = subprocess.run(
+            ["git", "-C", str(base), "diff", "--stat"],
+            capture_output=True, text=True, timeout=15,
+        ).stdout.strip()
+        untracked = subprocess.run(
+            ["git", "-C", str(base), "ls-files", "--others", "--exclude-standard"],
+            capture_output=True, text=True, timeout=15,
+        ).stdout.strip()
+        return diff, untracked
+    except Exception:
+        return "", ""
+
+
 def _git_note(base: Path) -> str:
     """Warn when there is no clean git tree to undo an unwanted write."""
     try:
@@ -393,6 +411,13 @@ SYSTEM_PROMPT_AGENTIC = (
     "No hagas commits ni push, ni publiques nada: de eso se encarga Claude con "
     "el visto bueno del usuario. Tampoco uses git para descartar o reescribir "
     "cambios. Deja tu trabajo en el árbol de trabajo tal cual.\n\n"
+    "Si necesitas algo que se sale de tu alcance —flashear o resetear hardware, "
+    "leer un puerto serie, que alguien mire físicamente un LED o una pantalla, "
+    "tocar ficheros fuera del proyecto, usar credenciales, hacer un commit— NO "
+    "lo inventes ni te rindas: usa `ask_claude` para pedirlo. Tu sesión se pausa "
+    "y sigue con la respuesta, sin perder nada de contexto. Pide una sola cosa "
+    "por vez y sé concreto: el comando exacto o la observación exacta que "
+    "necesitas, y qué esperas ver.\n\n"
     + TESTABILITY_RULE
     + "\n\nAdemás, deja la infraestructura de tests montada y funcionando "
     "aunque la tarea no la pidiera: el runner configurado y, si hace falta, un "
@@ -451,6 +476,26 @@ AGENTIC_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "ask_claude",
+            "description": (
+                "Pide a Claude que haga algo que tú no puedes hacer: flashear o "
+                "resetear hardware, leer un puerto serie, mirar físicamente un "
+                "LED o una pantalla, tocar ficheros fuera del proyecto, usar "
+                "credenciales, o hacer un commit. Tu sesión se pausa y continúa "
+                "con la respuesta, sin perder contexto. Pide UNA cosa por vez y "
+                "sé muy concreto: di el comando exacto o la observación exacta "
+                "que necesitas, y qué esperas ver."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"request": {"type": "string"}},
+                "required": ["request"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "run_bash",
             "description": (
                 "Ejecuta un comando de shell con el directorio de trabajo en la "
@@ -467,6 +512,48 @@ AGENTIC_TOOLS = [
 
 MAX_TOOL_OUTPUT = 4000
 BASH_TIMEOUT = 120
+
+# Paused agentic loops live here between the question and the answer. Outside
+# the project so a suspended run never shows up in the user's git status.
+SESSION_DIR = Path.home() / ".cache" / "kimi-delegate" / "sessions"
+SESSION_TTL_HOURS = 24
+_SESSION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _session_path(session_id: str) -> Path:
+    # The id comes back through an argument, so it is untrusted: only accept
+    # the exact shape we generate, never a path fragment.
+    if not _SESSION_ID_RE.match(session_id):
+        raise ValueError(f"session_id con formato inválido: {session_id!r}")
+    return SESSION_DIR / f"{session_id}.json"
+
+
+def _sweep_old_sessions() -> None:
+    cutoff = time.time() - SESSION_TTL_HOURS * 3600
+    try:
+        for f in SESSION_DIR.glob("*.json"):
+            if f.stat().st_mtime < cutoff:
+                f.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _save_session(state: dict) -> str:
+    SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    _sweep_old_sessions()
+    session_id = uuid.uuid4().hex
+    _session_path(session_id).write_text(json.dumps(state))
+    return session_id
+
+
+def _load_session(session_id: str) -> dict:
+    p = _session_path(session_id)
+    if not p.is_file():
+        raise FileNotFoundError(
+            f"No hay ninguna delegación pausada con id {session_id}. "
+            f"Puede haber expirado (caducan a las {SESSION_TTL_HOURS} h)."
+        )
+    return json.loads(p.read_text())
 
 # Commits, pushes and anything that publishes stay with Claude, done with the
 # user's approval — never the delegated agent. Also refused: the git commands
@@ -628,12 +715,34 @@ def delegate_agentic(
         {"role": "user", "content": _build_prompt(task, [], context)},
     ]
 
-    total_cost = 0.0
-    total_in = total_out = total_cached = 0
-    log: list[str] = []
+    state = {
+        "base_dir": str(base),
+        "messages": messages,
+        "log": [],
+        "totals": {"in": 0, "out": 0, "cached": 0, "cost": 0.0},
+        "turns_used": 0,
+        "max_turns": max_turns,
+    }
+    return _drive_agentic_loop(state)
+
+
+def _drive_agentic_loop(state: dict) -> str:
+    """Run the loop until it finishes, runs out of turns, or asks for help.
+
+    Split out of `delegate_agentic` so a paused run can be picked up again by
+    `resume_delegation` with its context intact.
+    """
+    base = Path(state["base_dir"])
+    messages = state["messages"]
+    log = state["log"]
+    totals = state["totals"]
+    client = _client()
     final = ""
 
-    for turn in range(1, max_turns + 1):
+    while state["turns_used"] < state["max_turns"]:
+        state["turns_used"] += 1
+        turn = state["turns_used"]
+
         resp = client.chat.completions.create(
             model=MODEL,
             messages=messages,
@@ -641,19 +750,18 @@ def delegate_agentic(
             tool_choice="auto",
             max_completion_tokens=MAX_OUTPUT_TOKENS,
         )
-        choice = resp.choices[0]
-        msg = choice.message
+        msg = resp.choices[0].message
 
         u = resp.usage
         if u:
             ptd = getattr(u, "prompt_tokens_details", None)
             cached = (getattr(ptd, "cached_tokens", 0) or 0) if ptd else 0
-            total_cost += (
+            totals["cost"] += (
                 (u.prompt_tokens - cached) * 0.95 + cached * 0.19 + u.completion_tokens * 4.00
             ) / 1e6
-            total_in += u.prompt_tokens
-            total_out += u.completion_tokens
-            total_cached += cached
+            totals["in"] += u.prompt_tokens
+            totals["out"] += u.completion_tokens
+            totals["cached"] += cached
 
         # The assistant turn must go back verbatim — including reasoning_content,
         # which Moonshot rejects the next request without. Dropping it is the
@@ -664,35 +772,72 @@ def delegate_agentic(
             final = msg.content or ""
             break
 
+        pending: tuple[str, str] | None = None
         for tc in msg.tool_calls:
             name = tc.function.name
             try:
                 args = json.loads(tc.function.arguments or "{}")
             except json.JSONDecodeError as e:
-                result = f"ERROR: argumentos JSON inválidos: {e}"
-                args = {}
+                args, result = {}, f"ERROR: argumentos JSON inválidos: {e}"
             else:
-                result = _run_agentic_tool(base, name, args)
+                if name == "ask_claude":
+                    if pending is None:
+                        # Leave this one unanswered and suspend below; its tool
+                        # result is what resume_delegation will supply.
+                        pending = (tc.id, args.get("request", ""))
+                        log.append(f"  {turn:>2}. ask_claude → pausa")
+                        continue
+                    result = (
+                        "ERROR: solo se puede pedir una cosa a la vez. "
+                        "Vuelve a preguntar esto cuando te respondan la anterior."
+                    )
+                else:
+                    result = _run_agentic_tool(base, name, args)
 
             detail = args.get("command") or args.get("path") or args.get("pattern") or ""
             log.append(f"  {turn:>2}. {name}({detail[:70]})")
-            messages.append(
-                {"role": "tool", "tool_call_id": tc.id, "content": result}
-            )
-    else:
-        final = f"(sin terminar: alcanzado el tope de {max_turns} turnos)"
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
-    try:
-        diff = subprocess.run(
-            ["git", "-C", str(base), "diff", "--stat"],
-            capture_output=True, text=True, timeout=15,
-        ).stdout.strip()
-        untracked = subprocess.run(
-            ["git", "-C", str(base), "ls-files", "--others", "--exclude-standard"],
-            capture_output=True, text=True, timeout=15,
-        ).stdout.strip()
-    except Exception:
-        diff = untracked = ""
+        if pending is not None:
+            call_id, request = pending
+            state["pending_tool_call_id"] = call_id
+            session_id = _save_session(state)
+            diff, untracked = _git_summary(base)
+            # Without the work so far, whoever answers is doing it blind — and a
+            # mistaken answer sends the agent chasing a bug that isn't there.
+            out = [
+                "⏸️  PAUSADO — Kimi necesita algo que no puede hacer él:",
+                "",
+                f"    {request}",
+                "",
+                f"Lo que lleva hecho ({len(log)} llamadas):",
+                *log,
+            ]
+            if diff:
+                out += ["", "git diff --stat:", diff]
+            if untracked:
+                out += ["", "Ficheros nuevos sin trackear:", untracked]
+            out += [
+                "",
+                "Comprueba eso antes de contestar: si lo que te pide ya está "
+                "resuelto, o si tu respuesta contradice lo que ha escrito, díselo "
+                "en vez de dejarle adivinar.",
+                "",
+                "Haz lo que pide (pregunta al usuario primero si implica hardware, "
+                "credenciales o algo irreversible) y devuélvele el resultado con:",
+                "",
+                f'    resume_delegation(session_id="{session_id}", result="...")',
+                "",
+                f"Su contexto está guardado. Lleva ~${totals['cost']:.5f} hasta ahora.",
+            ]
+            return "\n".join(out)
+    else:
+        final = f"(sin terminar: alcanzado el tope de {state['max_turns']} turnos)"
+
+    total_in, total_out = totals["in"], totals["out"]
+    total_cached, total_cost = totals["cached"], totals["cost"]
+
+    diff, untracked = _git_summary(base)
 
     out = [f"Kimi trabajó en {base} — {len(log)} llamadas a herramientas:", *log]
     if final:
@@ -711,6 +856,42 @@ def delegate_agentic(
         f"en {len(log)} llamadas · ~${total_cost:.5f}_",
     ]
     return "\n".join(out)
+
+
+@mcp.tool()
+def resume_delegation(session_id: str, result: str) -> str:
+    """Contesta a un `ask_claude` y reanuda la delegación pausada.
+
+    Kimi se pausa cuando necesita algo fuera de su alcance — flashear un ESP32,
+    leer un puerto serie, mirar un LED, tocar algo fuera del proyecto. Haz lo
+    que pedía (preguntando antes al usuario si implica hardware, credenciales o
+    algo irreversible) y pásale aquí lo que has observado.
+
+    Sé literal: pega la salida real del comando o describe exactamente lo que se
+    ve. Si no pudiste hacerlo, dilo igualmente y explica por qué — con eso Kimi
+    puede buscar otra vía en lugar de quedarse esperando.
+
+    Args:
+        session_id: el id que devolvió la pausa.
+        result: lo observado, tal cual. También sirve para decir que no se pudo.
+    """
+    try:
+        state = _load_session(session_id)
+    except (ValueError, FileNotFoundError) as e:
+        return f"ERROR: {e}"
+
+    call_id = state.pop("pending_tool_call_id", None)
+    if not call_id:
+        return "ERROR: esa sesión no está esperando ninguna respuesta."
+
+    state["messages"].append(
+        {"role": "tool", "tool_call_id": call_id, "content": result}
+    )
+
+    # Drop the saved copy now: from here the run either finishes or suspends
+    # again under a fresh id, and a stale file would invite a double resume.
+    _session_path(session_id).unlink(missing_ok=True)
+    return _drive_agentic_loop(state)
 
 
 if __name__ == "__main__":
