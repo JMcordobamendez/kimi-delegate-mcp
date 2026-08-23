@@ -1,7 +1,7 @@
 # kimi-delegate-mcp
 
 An MCP server that lets Claude Code delegate programming work to
-[Kimi K2.7-code](https://platform.moonshot.ai) (Moonshot AI) — from generating a
+[Kimi K2.7-code](https://platform.kimi.ai) (Moonshot AI) — from generating a
 single file to turning it loose as an autonomous agent that writes code, runs
 the tests and fixes itself — while Claude stays the orchestrator and decides
 what gets committed.
@@ -94,6 +94,19 @@ You should see `kimi-delegate: ... - ✔ Connected`.
 > until you restart. To test changes without restarting, import `server.py` in
 > a script and call the function directly, bypassing the MCP layer.
 
+**`Connected` means registered, not working.** It says the process started and
+spoke MCP — not that your key is valid or that Moonshot answered. Spend a
+fraction of a cent confirming the whole path:
+
+```
+delegate_to_kimi("Write a Python function clamp(value, low, high) that bounds
+value to [low, high] and raises ValueError if low > high. Nothing else.")
+```
+
+A code block plus a cost footer means it works end to end. An auth error means
+the key never reached the server — check `env` in the registration command, not
+the code.
+
 ---
 
 ## The tools
@@ -129,6 +142,24 @@ the I/O injected, stubbed the Arduino API, and left five host-side tests —
 timing assertions included — that run on a development machine with no hardware
 present. For embedded work that is the difference between testable and not.
 
+**When the domain is enumerable, do better than reading its tests.** Build an
+oracle the model never saw and sweep the whole input space. Asked to implement
+`to_roman(n)` for 1..3999, it reported "21 tests pass" — true, but its tests
+check only what it thought to check. Two independent properties settle it:
+
+```python
+# 1. an inverse the model never wrote
+from_roman(to_roman(n)) == n
+# 2. canonical form — a naive round-trip would accept IIII and VIIII
+re.match(r"^M{0,3}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})$", to_roman(n))
+```
+
+All 3,999 values passed. That is not "the tests are green", it is "no valid
+input exists where this fails". The technique works wherever a property can be
+checked without reimplementing the logic: inverse pairs (parse/serialise,
+encode/decode), invariants (a sorted list is still a permutation of its input),
+or an obviously-correct slow version checked against the fast one.
+
 ### Reporting
 
 All three report tokens in/out, how many were cache hits, how many went to the
@@ -158,6 +189,22 @@ the code, so the second charge disappears — **measured 82% lower Claude-side
 cost** on a two-file task, and the gap widens on edits to large existing files.
 
 Review moves from *before* the write to *after* it. Use it on a clean git tree.
+
+Because nothing is executed in this mode, a file that does not even parse would
+otherwise land on disk reported as a success. Every written `.py` file is parsed,
+and anything that fails is flagged prominently:
+
+```
+Written in /path/to/project:
+  A utils/slug.py (new, 19 lines)
+
+⚠️ **Written but does not parse** — review before trusting it:
+  ⚠ utils/slug.py: does not parse — unmatched '}' (line 19)
+```
+
+That is a real example: the model emitted an otherwise correct function and
+appended a stray `}`. The file is still written — git remains the undo path —
+but the run cannot pass silently.
 
 The model's output is untrusted input — it chooses these paths — so every one is
 resolved and checked before anything is written:
@@ -427,15 +474,56 @@ Verified against the live API, not just the docs:
 | Output ceiling | Accepts ≥131,072 | The budget here is 32,000 |
 
 Reasoning is not a rounding error: on a moderate task it was **2,314 of 3,635
-completion tokens (64%)**. A budget sized for the code alone truncates it — and
-a truncated reply leaves its last file block unclosed, so a naive parser drops
-it silently. Both write-capable tools check `finish_reason` and refuse to apply
-a truncated reply.
+completion tokens (64%)**. A budget sized for the code alone therefore truncates
+the reply — and a truncated reply leaves its last file block unclosed, so a
+naive parser drops it silently. Both write-capable tools check `finish_reason`
+and refuse to apply a truncated reply.
+
+That overhead also dominates small tasks, and it is **not predictable**. The
+same six-line `clamp` request, sent twice, spent 691 of 752 completion tokens on
+reasoning ($0.0033) and then 73 of 239 ($0.0011) — a 3× cost spread on an
+identical prompt. Since thinking cannot be disabled and its length cannot be
+steered, that variance is simply the price of entry.
+
+The usable rule is therefore about the floor, not the average: **a trivial
+delegation costs somewhere in the fractions-of-a-cent range regardless of how
+little work it is**, and you cannot predict where in that range it lands. If the
+task fits comfortably in a single edit, do it yourself. Delegation pays off on
+volume, not on errands.
 
 Multi-turn tool loops must feed the assistant turn back **including
 `reasoning_content`**, or Moonshot rejects the following request.
 
 ---
+
+## Tests
+
+The server confines a model's writes and blocks it from publishing, so its
+guards are worth testing. They are:
+
+```bash
+.venv/bin/pip install pytest
+MOONSHOT_API_KEY=dummy .venv/bin/python -m pytest tests/ -q
+```
+
+72 tests, no network: `_call_kimi` is the single network seam and every test
+that needs a reply injects one — the same rule this server asks delegated code
+to follow, applied to itself. They cover path confinement (including the
+documented symlink limitation), the command guard, session-id validation,
+output clipping, prompt ordering for cache stability, and `delegate_and_apply`
+end to end against canned replies.
+
+Passing tests are not the same as tests that bite, which is this project's whole
+suspicion of delegated work — so the guards were checked by breaking them on
+purpose:
+
+| Guard disabled | Tests that failed |
+|---|---|
+| Command guard (commits/pushes allowed) | 16 |
+| `base_dir` confinement (escapes allowed) | 4 |
+| `finish_reason` check (truncated replies applied) | 1 |
+| Python syntax check | 2 |
+| `session_id` validation | 8 |
 
 ## Notes on model choice
 
@@ -464,11 +552,11 @@ is an international transfer to a country with no adequacy decision.
 | Symptom | Cause |
 |---|---|
 | Tool doesn't appear in Claude Code | Server registered mid-session — restart Claude Code |
-| `MOONSHOT_API_KEY no está definida` | Key missing from the registration; re-run `claude mcp add` with `-e` |
+| `MOONSHOT_API_KEY is not set in the MCP process environment` | Key missing from the registration; re-run `claude mcp add` with `-e` |
 | Edits to `server.py` have no effect | The running session still has the old subprocess — restart |
-| `ABORTADO ... repo git limpio` | Uncommitted changes, often just `__pycache__`. Commit, stash, or gitignore them |
-| `ABORTADO: ... finish_reason='length'` | The task was too big for one reply. Split it up |
-| `No hay ninguna delegación pausada con id ...` | The session expired (24 h) or was already resumed. Start a fresh delegation |
+| `ABORTED before starting: ...` | Uncommitted changes, often just `__pycache__`. Commit, stash, or gitignore them |
+| `ABORTED: Kimi's reply was cut off ... finish_reason='length'` | The task was too big for one reply. Split it up |
+| `No paused delegation with id ...` | The session expired (24 h) or was already resumed. Start a fresh delegation |
 
 ## License
 

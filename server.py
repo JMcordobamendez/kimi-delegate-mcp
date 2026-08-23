@@ -13,6 +13,7 @@ Two tools, with different cost/safety trade-offs:
   Review moves from before-the-write to after-the-write, so it wants a git
   working tree underneath as the undo mechanism.
 """
+import ast
 import json
 import os
 import re
@@ -46,11 +47,11 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 # every mode asks for code that someone *else* can test independently — seams
 # to inject at, no hidden state — rather than trusting the tests it wrote.
 TESTABILITY_RULE = (
-    "Deja el código preparado para que otra persona pueda testearlo por su "
-    "cuenta: funciones puras siempre que se pueda, y los efectos secundarios "
-    "(red, disco, hora actual, aleatoriedad, subprocesos) aislados detrás de "
-    "parámetros inyectables en lugar de incrustados en la lógica. Nada de "
-    "estado global oculto ni de dependencias imposibles de sustituir."
+    "Leave the code so that someone else can test it independently: pure "
+    "functions wherever possible, and side effects (network, disk, current "
+    "time, randomness, subprocesses) isolated behind injectable parameters "
+    "rather than buried in the logic. No hidden global state, and no "
+    "dependencies that cannot be substituted."
 )
 
 # Kimi caches by *prefix*: identical leading tokens are billed at $0.19/M
@@ -59,26 +60,26 @@ TESTABILITY_RULE = (
 # nothing is ever cached. These system prompts are byte-for-byte identical on
 # every call, so they always head the cacheable prefix.
 SYSTEM_PROMPT = (
-    "Eres un modelo de apoyo al que se le delegan tareas de código acotadas. "
-    "Devuelve el código completo de cada fichero que cambies o crees, cada "
-    "uno en su propio bloque de código con la ruta como cabecera antes del "
-    "bloque. No hay forma de que ejecutes nada en el sistema del usuario: "
-    "limítate a proponer texto/código, no asumas acceso a herramientas.\n\n"
+    "You are a support model given bounded coding tasks. Return the complete "
+    "code for every file you change or create, each in its own code block "
+    "with the file path as a heading before the block. You have no way to run "
+    "anything on the user's system: propose text and code only, and do not "
+    "assume access to any tools.\n\n"
     + TESTABILITY_RULE
 )
 
 SYSTEM_PROMPT_APPLY = (
-    "Eres un modelo de apoyo al que se le delegan tareas de código acotadas. "
-    "Tu respuesta se parsea automáticamente y se escribe a disco, así que el "
-    "formato es obligatorio y estricto.\n\n"
-    "Para cada fichero que crees o modifiques emite exactamente:\n"
-    "FILE: ruta/relativa/del/fichero.ext\n"
-    "seguido de un bloque de código cercado con ``` que contenga el contenido "
-    "COMPLETO y final del fichero. Nunca fragmentos, nunca diffs, nunca '...' "
-    "ni elipsis: lo que emitas sustituye al fichero entero.\n\n"
-    "Las rutas son siempre relativas al directorio de trabajo. No uses rutas "
-    "absolutas ni '..'. No emitas texto fuera de ese formato, salvo como mucho "
-    "una línea final de resumen.\n\n"
+    "You are a support model given bounded coding tasks. Your reply is parsed "
+    "automatically and written to disk, so the format is mandatory and "
+    "strict.\n\n"
+    "For every file you create or modify, emit exactly:\n"
+    "FILE: relative/path/to/file.ext\n"
+    "followed by a ``` fenced code block containing the COMPLETE, final "
+    "contents of the file. Never fragments, never diffs, never '...' or any "
+    "ellipsis: what you emit replaces the entire file.\n\n"
+    "Paths are always relative to the working directory. Do not use absolute "
+    "paths or '..'. Emit no text outside that format, except at most a single "
+    "closing summary line.\n\n"
     + TESTABILITY_RULE
 )
 
@@ -108,7 +109,7 @@ def _client() -> OpenAI:
     api_key = os.environ.get("MOONSHOT_API_KEY")
     if not api_key:
         raise RuntimeError(
-            "MOONSHOT_API_KEY no está definida en el entorno del proceso MCP."
+            "MOONSHOT_API_KEY is not set in the MCP process environment."
         )
     return OpenAI(api_key=api_key, base_url=BASE_URL)
 
@@ -124,8 +125,8 @@ def _read_file(path_str: str) -> str:
     p = p.resolve()
     if _is_sensitive(p.name):
         raise ValueError(
-            f"'{path_str}' parece un fichero sensible (credenciales/secretos) — "
-            "no se envía a un proveedor externo. Pásalo explícitamente si estás seguro."
+            f"'{path_str}' looks like a sensitive file (credentials/secrets) — "
+            "it is not sent to an external provider. Pass it explicitly if you are sure."
         )
     if not p.is_file():
         raise FileNotFoundError(str(p))
@@ -142,16 +143,16 @@ def _build_prompt(task: str, file_paths: list[str], extra_context: str) -> str:
             content = _read_file(fp)
             context_blocks.append(f"### {fp}\n```\n{content}\n```")
         except Exception as e:
-            context_blocks.append(f"### {fp}\n[ERROR leyendo el fichero: {e}]")
+            context_blocks.append(f"### {fp}\n[ERROR reading the file: {e}]")
 
     # Stable first, varying last: file context repeats across delegations over
     # the same code, the task never does.
     parts = []
     if context_blocks:
-        parts.append("Ficheros de contexto:\n\n" + "\n\n".join(context_blocks))
+        parts.append("Context files:\n\n" + "\n\n".join(context_blocks))
     if extra_context:
-        parts.append(f"Contexto adicional:\n{extra_context}")
-    parts.append(f"Tarea:\n{task}")
+        parts.append(f"Additional context:\n{extra_context}")
+    parts.append(f"Task:\n{task}")
     return "\n\n".join(parts)
 
 
@@ -191,13 +192,30 @@ def _call_kimi(system_prompt: str, prompt: str) -> tuple[str, str, str]:
         # rather than assumed.
         billed_in = usage.prompt_tokens - cached
         cost = (billed_in * 0.95 + cached * 0.19 + usage.completion_tokens * 4.00) / 1e6
-        think = f", {reasoning} de razonamiento" if reasoning else ""
+        think = f", {reasoning} reasoning" if reasoning else ""
         footer = (
             f"_Kimi K2.7-code · {usage.prompt_tokens} tokens in "
-            f"({cached} cacheados) / {usage.completion_tokens} tokens out"
+            f"({cached} cached) / {usage.completion_tokens} tokens out"
             f"{think} · ~${cost:.5f}_"
         )
     return message, footer, choice.finish_reason or ""
+
+
+def _syntax_error(rel: Path, text: str) -> str:
+    """Report a Python file that does not even parse.
+
+    `delegate_and_apply` has no execution step, so nothing else would notice: a
+    single stray character makes the module unimportable and the run still
+    reports success. Seen for real — the model appended a lone '}' after an
+    otherwise correct function.
+    """
+    if rel.suffix != ".py":
+        return ""
+    try:
+        ast.parse(text)
+    except SyntaxError as e:
+        return f"  ⚠ {rel}: does not parse — {e.msg} (line {e.lineno})"
+    return ""
 
 
 def _resolve_write_path(base: Path, raw: str) -> Path:
@@ -212,14 +230,14 @@ def _resolve_write_path(base: Path, raw: str) -> Path:
     # try to write over the directory. Seen for real: the model once emitted a
     # bare ANSI reset code where the path belonged.
     if not rel:
-        raise ValueError(f"ruta vacía tras limpiarla: {raw!r}")
+        raise ValueError(f"path was empty after cleaning: {raw!r}")
     if rel.startswith("/") or rel.startswith("~"):
-        raise ValueError(f"ruta absoluta rechazada: {rel}")
+        raise ValueError(f"absolute path refused: {rel}")
     target = (base / rel).resolve()
     if not target.is_relative_to(base):
-        raise ValueError(f"ruta fuera del directorio de trabajo: {rel}")
+        raise ValueError(f"path outside the working directory: {rel}")
     if _is_sensitive(target.name):
-        raise ValueError(f"nombre de fichero sensible, no se escribe: {rel}")
+        raise ValueError(f"sensitive filename, not written: {rel}")
     return target
 
 
@@ -247,44 +265,45 @@ def _git_note(base: Path) -> str:
             capture_output=True, text=True, timeout=10,
         )
         if inside.returncode != 0 or inside.stdout.strip() != "true":
-            return "⚠ No es un repo git: no hay forma sencilla de deshacer estos cambios."
+            return "⚠ Not a git repo: there is no easy way to undo these changes."
         dirty = subprocess.run(
             ["git", "-C", str(base), "status", "--porcelain"],
             capture_output=True, text=True, timeout=10,
         )
         if dirty.returncode == 0 and dirty.stdout.strip():
             return (
-                "⚠ El repo ya tenía cambios sin commitear antes de escribir: "
-                "los cambios de Kimi quedan mezclados con ellos."
+                "⚠ The repo already had uncommitted changes before writing: "
+                "Kimi's changes are now mixed in with them."
             )
         return ""
     except Exception:
-        return "⚠ No se pudo comprobar el estado de git."
+        return "⚠ Could not check the git status."
 
 
 @mcp.tool()
 def delegate_to_kimi(task: str, file_paths: list[str] = [], extra_context: str = "") -> str:
-    """Delega una tarea de código a Kimi K2.7-code y devuelve el código propuesto.
+    """Delegate a coding task to Kimi K2.7-code and return the proposed code.
 
-    Kimi NO escribe nada: devuelve texto que tú revisas y aplicas con
-    Write/Edit. Más seguro, pero más caro — al reemitir el código para
-    aplicarlo lo pagas dos veces. Para trabajo voluminoso donde el ahorro
-    importe, usa `delegate_and_apply`.
+    Kimi writes nothing: it returns text for you to review and apply with
+    Write/Edit. Safer, but more expensive — re-emitting the code to apply it
+    means paying for it twice. For bulk work where the saving matters, use
+    `delegate_and_apply`.
 
-    No delegar código de proyectos con datos personales de terceros (RGPD).
+    Do not delegate code from projects holding other people's personal data
+    (GDPR).
 
     Args:
-        task: descripción clara y acotada de lo que debe hacer Kimi.
-        file_paths: rutas (relativas al cwd, o absolutas) de ficheros de
-            contexto. Los que tengan nombre de pinta sensible se rechazan.
-        extra_context: contexto adicional en texto libre.
+        task: a clear, bounded description of what Kimi should do.
+        file_paths: paths (relative to the cwd, or absolute) of context files.
+            Any whose name looks sensitive is refused.
+        extra_context: additional free-text context.
     """
     prompt = _build_prompt(task, file_paths, extra_context)
     message, footer, finish = _call_kimi(SYSTEM_PROMPT, prompt)
     if finish == "length":
         message += (
-            "\n\n⚠️ **Respuesta truncada por límite de tokens** — está incompleta. "
-            "No la apliques tal cual; divide la tarea y reintenta."
+            "\n\n⚠️ **Reply truncated by the token limit** — it is incomplete. "
+            "Do not apply it as-is; split the task up and retry."
         )
     return f"{message}\n\n---\n{footer}" if footer else message
 
@@ -296,27 +315,28 @@ def delegate_and_apply(
     file_paths: list[str] = [],
     extra_context: str = "",
 ) -> str:
-    """Delega una tarea a Kimi y **escribe los ficheros directamente**, devolviendo un diff.
+    """Delegate a task to Kimi and **write the files directly**, returning a diff.
 
-    Ésta es la variante barata: como el código no vuelve por tu contexto para
-    que lo reemitas, no lo pagas dos veces. A cambio la revisión pasa a ser
-    *posterior* a la escritura — revisa el diff que devuelve y usa git para
-    revertir si algo no cuadra. Úsala en un repo git limpio.
+    This is the cheap variant: because the code never comes back through your
+    context for you to re-emit, you do not pay for it twice. In exchange,
+    review moves to *after* the write — read the diff it returns and use git to
+    revert if something is off. Use it on a clean git repo.
 
-    Toda escritura queda confinada a `base_dir`: se rechazan rutas absolutas,
-    '..' y nombres de fichero sensibles.
+    Every write is confined to `base_dir`: absolute paths, '..' and sensitive
+    filenames are refused.
 
-    No delegar código de proyectos con datos personales de terceros (RGPD).
+    Do not delegate code from projects holding other people's personal data
+    (GDPR).
 
     Args:
-        task: descripción clara y acotada de lo que debe hacer Kimi.
-        base_dir: directorio raíz del proyecto. Es la frontera de escritura.
-        file_paths: rutas de ficheros de contexto a pasarle a Kimi.
-        extra_context: contexto adicional en texto libre.
+        task: a clear, bounded description of what Kimi should do.
+        base_dir: the project root. This is the write boundary.
+        file_paths: paths of context files to pass to Kimi.
+        extra_context: additional free-text context.
     """
     base = Path(base_dir).expanduser().resolve()
     if not base.is_dir():
-        return f"ERROR: base_dir no existe o no es un directorio: {base}"
+        return f"ERROR: base_dir does not exist or is not a directory: {base}"
 
     git_note = _git_note(base)
 
@@ -328,10 +348,11 @@ def delegate_and_apply(
     # run reports partial work as success. Refuse to write anything instead.
     if finish == "length":
         return (
-            "ABORTADO: la respuesta de Kimi se cortó por límite de tokens "
-            f"(finish_reason='length'), así que está incompleta. **No se ha escrito "
-            "nada** — aplicarla dejaría ficheros a medias o trabajo perdido en "
-            "silencio. Divide la tarea en partes más pequeñas y reintenta.\n\n"
+            "ABORTED: Kimi's reply was cut off by the token limit "
+            f"(finish_reason='length'), so it is incomplete. **Nothing was "
+            "written** — applying it would leave half-finished files or "
+            "silently lose work. Split the task into smaller parts and "
+            "retry.\n\n"
             f"---\n{footer}"
         )
 
@@ -339,14 +360,15 @@ def delegate_and_apply(
     if not blocks:
         # Nothing parseable — hand back the raw text so the work isn't lost.
         return (
-            "No se encontró ningún bloque 'FILE:' en la respuesta; no se ha "
-            "escrito nada. Respuesta cruda de Kimi:\n\n"
+            "No 'FILE:' block was found in the reply; nothing was written. "
+            "Raw reply from Kimi:\n\n"
             f"{message}\n\n---\n{footer}"
         )
 
     summary: list[str] = []
     diff_lines: list[str] = []
     errors: list[str] = []
+    broken: list[str] = []
 
     for m in blocks:
         try:
@@ -361,11 +383,15 @@ def delegate_and_apply(
         old_text = target.read_text(errors="replace") if existed else ""
 
         if existed and old_text == new_text:
-            summary.append(f"  = {rel} (sin cambios)")
+            summary.append(f"  = {rel} (unchanged)")
             continue
 
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(new_text)
+
+        bad = _syntax_error(rel, new_text)
+        if bad:
+            broken.append(bad)
 
         if existed:
             old_lines = old_text.splitlines(keepends=True)
@@ -377,11 +403,17 @@ def delegate_and_apply(
             diff_lines.extend(x.rstrip("\n") for x in d)
         else:
             n = len(new_text.splitlines())
-            summary.append(f"  A {rel} (nuevo, {n} líneas)")
+            summary.append(f"  A {rel} (new, {n} lines)")
 
-    out = [f"Escrito en {base}:", *summary]
+    out = [f"Written in {base}:", *summary]
     if errors:
-        out += ["", "Rechazado:", *errors]
+        out += ["", "Refused:", *errors]
+    if broken:
+        out += [
+            "",
+            "⚠️ **Written but does not parse** — review before trusting it:",
+            *broken,
+        ]
     if git_note:
         out += ["", git_note]
 
@@ -390,8 +422,8 @@ def delegate_and_apply(
         out += ["", "--- diff ---", *shown]
         if len(diff_lines) > MAX_DIFF_LINES:
             out.append(
-                f"... (diff recortado: {len(diff_lines) - MAX_DIFF_LINES} líneas más; "
-                "usa git diff para verlo entero)"
+                f"... (diff clipped: {len(diff_lines) - MAX_DIFF_LINES} more lines; "
+                "use git diff to see it in full)"
             )
 
     if footer:
@@ -400,37 +432,37 @@ def delegate_and_apply(
 
 
 SYSTEM_PROMPT_AGENTIC = (
-    "Eres un agente de programación trabajando dentro de un proyecto. Tienes "
-    "herramientas para leer, escribir y listar ficheros, y para ejecutar "
-    "comandos de shell. El directorio de trabajo ya está fijado en la raíz del "
-    "proyecto: usa siempre rutas relativas.\n\n"
-    "Método de trabajo: explora lo que necesites, haz los cambios, y "
-    "**verifica ejecutando los tests o el comando que corresponda**. Si algo "
-    "falla, corrígelo y vuelve a ejecutarlo. No des la tarea por terminada sin "
-    "haberla comprobado de verdad.\n\n"
-    "No hagas commits ni push, ni publiques nada: de eso se encarga Claude con "
-    "el visto bueno del usuario. Tampoco uses git para descartar o reescribir "
-    "cambios. Deja tu trabajo en el árbol de trabajo tal cual.\n\n"
-    "Si necesitas algo que se sale de tu alcance —flashear o resetear hardware, "
-    "leer un puerto serie, que alguien mire físicamente un LED o una pantalla, "
-    "tocar ficheros fuera del proyecto, usar credenciales, hacer un commit— NO "
-    "lo inventes ni te rindas: usa `ask_claude` para pedirlo. Tu sesión se pausa "
-    "y sigue con la respuesta, sin perder nada de contexto. Pide una sola cosa "
-    "por vez y sé concreto: el comando exacto o la observación exacta que "
-    "necesitas, y qué esperas ver.\n\n"
+    "You are a programming agent working inside a project. You have tools to "
+    "read, write and list files, and to run shell commands. The working "
+    "directory is already set to the project root: always use relative "
+    "paths.\n\n"
+    "How to work: explore whatever you need, make the changes, and **verify by "
+    "running the tests or whatever command applies**. If something fails, fix "
+    "it and run it again. Do not call the task finished without having "
+    "actually checked it.\n\n"
+    "Do not commit, push, or publish anything: Claude handles that with the "
+    "user's approval. Do not use git to discard or rewrite changes either. "
+    "Leave your work in the working tree as it is.\n\n"
+    "If you need something beyond your reach — flashing or resetting hardware, "
+    "reading a serial port, someone physically looking at an LED or a display, "
+    "touching files outside the project, using credentials, making a commit — "
+    "do NOT invent it and do not give up: use `ask_claude` to request it. Your "
+    "session pauses and continues with the answer, losing no context. Ask for "
+    "one thing at a time and be specific: the exact command or the exact "
+    "observation you need, and what you expect to see.\n\n"
     + TESTABILITY_RULE
-    + "\n\nAdemás, deja la infraestructura de tests montada y funcionando "
-    "aunque la tarea no la pidiera: el runner configurado y, si hace falta, un "
-    "conftest.py con fixtures para lo externo (red, disco, reloj). La idea es "
-    "que quien venga detrás pueda escribir un test suyo y ejecutarlo sin "
-    "montar nada.\n\n"
-    "Tu resumen final debe incluir, sí o sí:\n"
-    "1. El comando EXACTO para ejecutar los tests, tal y como funciona en este "
-    "proyecto (con la ruta del intérprete si has usado un venv).\n"
-    "2. Qué fixtures o puntos de inyección has dejado disponibles.\n"
-    "3. Qué ha quedado difícil de testear y por qué.\n\n"
-    "Cuando hayas terminado y verificado, responde con ese resumen en texto "
-    "plano y sin llamar a más herramientas."
+    + "\n\nOn top of that, leave the test infrastructure set up and working "
+    "even if the task did not ask for it: the runner configured and, if "
+    "needed, a conftest.py with fixtures for anything external (network, disk, "
+    "clock). The goal is that whoever comes next can write a test of their own "
+    "and run it without setting anything up.\n\n"
+    "Your final summary must include, without fail:\n"
+    "1. The EXACT command to run the tests, exactly as it works in this "
+    "project (including the interpreter path if you used a venv).\n"
+    "2. Which fixtures or injection points you left available.\n"
+    "3. What stayed hard to test, and why.\n\n"
+    "When you are finished and have verified it, reply with that summary in "
+    "plain text and without calling any more tools."
 )
 
 AGENTIC_TOOLS = [
@@ -438,7 +470,7 @@ AGENTIC_TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Lee un fichero del proyecto. Ruta relativa a la raíz.",
+            "description": "Read a project file. Path relative to the root.",
             "parameters": {
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
@@ -450,7 +482,7 @@ AGENTIC_TOOLS = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "Escribe (crea o reemplaza) un fichero. Ruta relativa a la raíz.",
+            "description": "Write (create or replace) a file. Path relative to the root.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -465,7 +497,7 @@ AGENTIC_TOOLS = [
         "type": "function",
         "function": {
             "name": "list_files",
-            "description": "Lista ficheros del proyecto que casan con un glob, p.ej. '**/*.py'.",
+            "description": "List project files matching a glob, e.g. '**/*.py'.",
             "parameters": {
                 "type": "object",
                 "properties": {"pattern": {"type": "string"}},
@@ -478,13 +510,13 @@ AGENTIC_TOOLS = [
         "function": {
             "name": "ask_claude",
             "description": (
-                "Pide a Claude que haga algo que tú no puedes hacer: flashear o "
-                "resetear hardware, leer un puerto serie, mirar físicamente un "
-                "LED o una pantalla, tocar ficheros fuera del proyecto, usar "
-                "credenciales, o hacer un commit. Tu sesión se pausa y continúa "
-                "con la respuesta, sin perder contexto. Pide UNA cosa por vez y "
-                "sé muy concreto: di el comando exacto o la observación exacta "
-                "que necesitas, y qué esperas ver."
+                "Ask Claude to do something you cannot: flash or reset "
+                "hardware, read a serial port, physically look at an LED or a "
+                "display, touch files outside the project, use credentials, or "
+                "make a commit. Your session pauses and continues with the "
+                "answer, losing no context. Ask for ONE thing at a time and be "
+                "very specific: give the exact command or the exact "
+                "observation you need, and what you expect to see."
             ),
             "parameters": {
                 "type": "object",
@@ -498,8 +530,8 @@ AGENTIC_TOOLS = [
         "function": {
             "name": "run_bash",
             "description": (
-                "Ejecuta un comando de shell con el directorio de trabajo en la "
-                "raíz del proyecto. Úsalo sobre todo para ejecutar los tests."
+                "Run a shell command with the working directory set to the "
+                "project root. Use it above all to run the tests."
             ),
             "parameters": {
                 "type": "object",
@@ -524,7 +556,7 @@ def _session_path(session_id: str) -> Path:
     # The id comes back through an argument, so it is untrusted: only accept
     # the exact shape we generate, never a path fragment.
     if not _SESSION_ID_RE.match(session_id):
-        raise ValueError(f"session_id con formato inválido: {session_id!r}")
+        raise ValueError(f"malformed session_id: {session_id!r}")
     return SESSION_DIR / f"{session_id}.json"
 
 
@@ -550,8 +582,8 @@ def _load_session(session_id: str) -> dict:
     p = _session_path(session_id)
     if not p.is_file():
         raise FileNotFoundError(
-            f"No hay ninguna delegación pausada con id {session_id}. "
-            f"Puede haber expirado (caducan a las {SESSION_TTL_HOURS} h)."
+            f"No paused delegation with id {session_id}. "
+            f"It may have expired (sessions last {SESSION_TTL_HOURS} h)."
         )
     return json.loads(p.read_text())
 
@@ -582,8 +614,8 @@ def _clip(text: str, keep_tail: bool = False) -> str:
         head = MAX_TOOL_OUTPUT // 2
         tail = MAX_TOOL_OUTPUT - head
         cut = len(text) - MAX_TOOL_OUTPUT
-        return f"{text[:head]}\n... [recortado {cut} chars del medio] ...\n{text[-tail:]}"
-    return text[:MAX_TOOL_OUTPUT] + f"\n... [recortado, {len(text) - MAX_TOOL_OUTPUT} chars más]"
+        return f"{text[:head]}\n... [{cut} chars clipped from the middle] ...\n{text[-tail:]}"
+    return text[:MAX_TOOL_OUTPUT] + f"\n... [clipped, {len(text) - MAX_TOOL_OUTPUT} more chars]"
 
 
 def _probe_environment(base: Path) -> str:
@@ -604,15 +636,15 @@ def _probe_environment(base: Path) -> str:
             out = (r.stdout or r.stderr).strip()
             return out.splitlines()[0] if out else "no"
         except Exception:
-            return "no se pudo comprobar"
+            return "could not check"
 
     return (
-        "Entorno ya comprobado (no gastes turnos en redescubrirlo):\n"
-        f"- intérprete: {sh('python3 --version')}\n"
-        f"- pytest ya instalado: {sh('python3 -m pytest --version 2>&1 | head -1')}\n"
-        f"- venv existente en el proyecto: {sh('ls -d venv .venv 2>/dev/null | head -1')}\n"
-        f"- ficheros de proyecto: {sh('ls requirements*.txt pyproject.toml setup.py package.json Makefile 2>/dev/null | tr \"\\n\" \" \"')}\n"
-        f"- tests que ya existen: {sh('ls test_*.py *_test.py tests 2>/dev/null | head -5 | tr \"\\n\" \" \"')}"
+        "Environment already checked (do not spend turns rediscovering it):\n"
+        f"- interpreter: {sh('python3 --version')}\n"
+        f"- pytest already installed: {sh('python3 -m pytest --version 2>&1 | head -1')}\n"
+        f"- existing venv in the project: {sh('ls -d venv .venv 2>/dev/null | head -1')}\n"
+        f"- project files: {sh('ls requirements*.txt pyproject.toml setup.py package.json Makefile 2>/dev/null | tr \"\\n\" \" \"')}\n"
+        f"- tests already present: {sh('ls test_*.py *_test.py tests 2>/dev/null | head -5 | tr \"\\n\" \" \"')}"
     )
 
 
@@ -622,14 +654,14 @@ def _run_agentic_tool(base: Path, name: str, args: dict) -> str:
         if name == "read_file":
             p = _resolve_write_path(base, args["path"])
             if not p.is_file():
-                return f"ERROR: no existe {args['path']}"
+                return f"ERROR: {args['path']} does not exist"
             return _clip(p.read_text(errors="replace"))
 
         if name == "write_file":
             p = _resolve_write_path(base, args["path"])
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(args["content"])
-            return f"OK: escrito {p.relative_to(base)} ({len(args['content'].splitlines())} líneas)"
+            return f"OK: wrote {p.relative_to(base)} ({len(args['content'].splitlines())} lines)"
 
         if name == "list_files":
             pattern = args.get("pattern", "**/*")
@@ -638,15 +670,15 @@ def _run_agentic_tool(base: Path, name: str, args: dict) -> str:
                 for f in sorted(base.glob(pattern))
                 if f.is_file() and ".git/" not in str(f)
             ]
-            return _clip("\n".join(hits[:200]) or "(sin resultados)")
+            return _clip("\n".join(hits[:200]) or "(no matches)")
 
         if name == "run_bash":
             if _FORBIDDEN_CMD_RE.search(args["command"]):
                 return (
-                    "RECHAZADO: los commits, los push y cualquier publicación los "
-                    "hace Claude con el visto bueno del usuario, no tú. Tampoco "
-                    "puedes usar git para descartar o reescribir cambios. Deja el "
-                    "trabajo en el árbol y descríbelo en tu resumen final."
+                    "REFUSED: commits, pushes and anything that publishes are "
+                    "done by Claude with the user's approval, not by you. You "
+                    "also cannot use git to discard or rewrite changes. Leave "
+                    "the work in the tree and describe it in your final summary."
                 )
             r = subprocess.run(
                 args["command"], shell=True, cwd=str(base),
@@ -655,9 +687,9 @@ def _run_agentic_tool(base: Path, name: str, args: dict) -> str:
             out = (r.stdout or "") + (("\n[stderr]\n" + r.stderr) if r.stderr else "")
             return _clip(f"[exit {r.returncode}]\n{out}".strip(), keep_tail=True)
 
-        return f"ERROR: herramienta desconocida {name}"
+        return f"ERROR: unknown tool {name}"
     except subprocess.TimeoutExpired:
-        return f"ERROR: el comando excedió {BASH_TIMEOUT}s y se abortó"
+        return f"ERROR: the command exceeded {BASH_TIMEOUT}s and was aborted"
     except Exception as e:
         return f"ERROR: {type(e).__name__}: {e}"
 
@@ -669,38 +701,38 @@ def delegate_agentic(
     extra_context: str = "",
     max_turns: int = 25,
 ) -> str:
-    """Lanza a Kimi como **agente autónomo** dentro de un proyecto, con shell.
+    """Turn Kimi loose as an **autonomous agent** inside a project, with a shell.
 
-    A diferencia de las otras dos herramientas, aquí Kimi no da una respuesta y
-    para: explora el proyecto, edita, **ejecuta los tests, ve si fallan y se
-    corrige**, en bucle, hasta terminar. Es lo que mejor aprovecha a K2.7-code,
-    que está afinado para uso agéntico de herramientas.
+    Unlike the other two tools, Kimi does not give an answer and stop here: it
+    explores the project, edits, **runs the tests, sees them fail and corrects
+    itself**, in a loop, until it is done. This is what makes best use of
+    K2.7-code, which is tuned for agentic tool use.
 
-    Requiere un repo git limpio: git es el mecanismo de deshacer, y al terminar
-    se devuelve el `git diff --stat` de lo que haya tocado.
+    Requires a clean git repo: git is the undo mechanism, and when it finishes
+    the `git diff --stat` of whatever it touched is returned.
 
-    ⚠️ Kimi ejecuta comandos de shell reales. El directorio de trabajo se fija
-    a `base_dir`, pero un comando puede salirse de ahí con rutas absolutas: el
-    confinamiento es de conveniencia, no una jaula. Todo lo que lea se envía a
-    Moonshot. No usar en proyectos con datos de terceros (RGPD).
+    ⚠️ Kimi runs real shell commands. The working directory is pinned to
+    `base_dir`, but a command can leave it with an absolute path: the
+    confinement is a convenience, not a cage. Everything it reads is sent to
+    Moonshot. Do not use on projects holding third-party data (GDPR).
 
     Args:
-        task: el objetivo, con su criterio de "terminado" (p.ej. "que pase pytest").
-        base_dir: raíz del proyecto. Debe ser un repo git sin cambios pendientes.
-        extra_context: contexto adicional en texto libre.
-        max_turns: tope de iteraciones, para que un bucle no se desboque.
+        task: the goal, with its "done" criterion (e.g. "until pytest passes").
+        base_dir: the project root. Must be a git repo with no pending changes.
+        extra_context: additional free-text context.
+        max_turns: iteration cap, so a loop cannot run away.
     """
     base = Path(base_dir).expanduser().resolve()
     if not base.is_dir():
-        return f"ERROR: base_dir no existe o no es un directorio: {base}"
+        return f"ERROR: base_dir does not exist or is not a directory: {base}"
 
     note = _git_note(base)
     if note:
         return (
-            f"ABORTADO antes de empezar: {note}\n\n"
-            "El modo agéntico ejecuta comandos y edita ficheros sin revisión "
-            "intermedia, así que exige un repo git limpio para poder deshacer. "
-            "Commitea o descarta lo que tengas pendiente y reintenta."
+            f"ABORTED before starting: {note}\n\n"
+            "Agentic mode runs commands and edits files with no review in "
+            "between, so it requires a clean git repo to make undo possible. "
+            "Commit or discard whatever is pending and retry."
         )
 
     # Stable-first ordering again: the environment block is the same across
@@ -778,18 +810,18 @@ def _drive_agentic_loop(state: dict) -> str:
             try:
                 args = json.loads(tc.function.arguments or "{}")
             except json.JSONDecodeError as e:
-                args, result = {}, f"ERROR: argumentos JSON inválidos: {e}"
+                args, result = {}, f"ERROR: invalid JSON arguments: {e}"
             else:
                 if name == "ask_claude":
                     if pending is None:
                         # Leave this one unanswered and suspend below; its tool
                         # result is what resume_delegation will supply.
                         pending = (tc.id, args.get("request", ""))
-                        log.append(f"  {turn:>2}. ask_claude → pausa")
+                        log.append(f"  {turn:>2}. ask_claude → paused")
                         continue
                     result = (
-                        "ERROR: solo se puede pedir una cosa a la vez. "
-                        "Vuelve a preguntar esto cuando te respondan la anterior."
+                        "ERROR: you can only ask for one thing at a time. "
+                        "Ask this again once the previous one is answered."
                     )
                 else:
                     result = _run_agentic_tool(base, name, args)
@@ -806,74 +838,75 @@ def _drive_agentic_loop(state: dict) -> str:
             # Without the work so far, whoever answers is doing it blind — and a
             # mistaken answer sends the agent chasing a bug that isn't there.
             out = [
-                "⏸️  PAUSADO — Kimi necesita algo que no puede hacer él:",
+                "⏸️  PAUSED — Kimi needs something it cannot do itself:",
                 "",
                 f"    {request}",
                 "",
-                f"Lo que lleva hecho ({len(log)} llamadas):",
+                f"What it has done so far ({len(log)} calls):",
                 *log,
             ]
             if diff:
                 out += ["", "git diff --stat:", diff]
             if untracked:
-                out += ["", "Ficheros nuevos sin trackear:", untracked]
+                out += ["", "New untracked files:", untracked]
             out += [
                 "",
-                "Comprueba eso antes de contestar: si lo que te pide ya está "
-                "resuelto, o si tu respuesta contradice lo que ha escrito, díselo "
-                "en vez de dejarle adivinar.",
+                "Check that before answering: if what it is asking for is "
+                "already solved, or if your answer contradicts what it has "
+                "written, tell it so instead of letting it guess.",
                 "",
-                "Haz lo que pide (pregunta al usuario primero si implica hardware, "
-                "credenciales o algo irreversible) y devuélvele el resultado con:",
+                "Do what it asks (ask the user first if it involves hardware, "
+                "credentials, or anything irreversible) and return the result "
+                "with:",
                 "",
                 f'    resume_delegation(session_id="{session_id}", result="...")',
                 "",
-                f"Su contexto está guardado. Lleva ~${totals['cost']:.5f} hasta ahora.",
+                f"Its context is saved. ~${totals['cost']:.5f} spent so far.",
             ]
             return "\n".join(out)
     else:
-        final = f"(sin terminar: alcanzado el tope de {state['max_turns']} turnos)"
+        final = f"(unfinished: hit the {state['max_turns']}-turn cap)"
 
     total_in, total_out = totals["in"], totals["out"]
     total_cached, total_cost = totals["cached"], totals["cost"]
 
     diff, untracked = _git_summary(base)
 
-    out = [f"Kimi trabajó en {base} — {len(log)} llamadas a herramientas:", *log]
+    out = [f"Kimi worked in {base} — {len(log)} tool calls:", *log]
     if final:
-        out += ["", "Resumen de Kimi:", final]
+        out += ["", "Kimi's summary:", final]
     if diff:
         out += ["", "git diff --stat:", diff]
     if untracked:
-        out += ["", "Ficheros nuevos sin trackear:", untracked]
+        out += ["", "New untracked files:", untracked]
     out += [
         "",
         "---",
         # Cache hits matter most here: every turn resends the whole history, so
         # the repeated prefix is the bulk of what is billed.
-        f"_Kimi K2.7-code · {total_in} tokens in ({total_cached} cacheados, "
+        f"_Kimi K2.7-code · {total_in} tokens in ({total_cached} cached, "
         f"{100 * total_cached // max(total_in, 1)}%) / {total_out} out "
-        f"en {len(log)} llamadas · ~${total_cost:.5f}_",
+        f"across {len(log)} calls · ~${total_cost:.5f}_",
     ]
     return "\n".join(out)
 
 
 @mcp.tool()
 def resume_delegation(session_id: str, result: str) -> str:
-    """Contesta a un `ask_claude` y reanuda la delegación pausada.
+    """Answer an `ask_claude` and resume the paused delegation.
 
-    Kimi se pausa cuando necesita algo fuera de su alcance — flashear un ESP32,
-    leer un puerto serie, mirar un LED, tocar algo fuera del proyecto. Haz lo
-    que pedía (preguntando antes al usuario si implica hardware, credenciales o
-    algo irreversible) y pásale aquí lo que has observado.
+    Kimi pauses when it needs something beyond its reach — flashing an ESP32,
+    reading a serial port, looking at an LED, touching something outside the
+    project. Do what it asked (asking the user first if it involves hardware,
+    credentials, or anything irreversible) and pass back what you observed.
 
-    Sé literal: pega la salida real del comando o describe exactamente lo que se
-    ve. Si no pudiste hacerlo, dilo igualmente y explica por qué — con eso Kimi
-    puede buscar otra vía en lugar de quedarse esperando.
+    Be literal: paste the real command output, or describe exactly what is
+    visible. If you could not do it, say so anyway and explain why — that lets
+    Kimi try another route instead of waiting.
 
     Args:
-        session_id: el id que devolvió la pausa.
-        result: lo observado, tal cual. También sirve para decir que no se pudo.
+        session_id: the id the pause returned.
+        result: what you observed, verbatim. Also the place to say it failed.
     """
     try:
         state = _load_session(session_id)
@@ -882,7 +915,7 @@ def resume_delegation(session_id: str, result: str) -> str:
 
     call_id = state.pop("pending_tool_call_id", None)
     if not call_id:
-        return "ERROR: esa sesión no está esperando ninguna respuesta."
+        return "ERROR: that session is not waiting for an answer."
 
     state["messages"].append(
         {"role": "tool", "tool_call_id": call_id, "content": result}
