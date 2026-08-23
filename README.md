@@ -262,6 +262,22 @@ Be literal in `result`: paste the real output, or describe exactly what is
 visible. Saying you *couldn't* do it is also a useful answer — it lets the agent
 try another route instead of waiting.
 
+How far a request travels depends on what it needs:
+
+| Request | Chain |
+|---|---|
+| Run a command — flash, read a serial port, run something outside the project | agent → **you** → agent |
+| Observe something physical — "is the LED blinking SOS?", "is the board plugged in?", "press reset" | agent → you → **a human** → you → agent |
+| Commit or push | agent → you → **human approves** → you → agent |
+
+Many requests you can settle yourself. But hardware, credentials and anything
+irreversible are worth confirming with a person first — reflashing someone's
+board is not a decision to take on their behalf.
+
+**Expect more than one pause.** Each resume can end in another, under a new
+session id. In the ESP32 test it paused twice: asked to be flashed, got an
+answer, made a change, and asked to be re-verified.
+
 > **Answer carefully, and check the work log first.** Given a report that
 > contradicts its own correct code, this model does not push back — it
 > improvises. In testing, a deliberately false observation ("dots and dashes
