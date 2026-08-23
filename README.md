@@ -6,14 +6,29 @@ single file to turning it loose as an autonomous agent that writes code, runs
 the tests and fixes itself — while Claude stays the orchestrator and decides
 what gets committed.
 
-Three tools, three levels of trust, chosen per task:
+Three modes, three levels of trust, chosen per task:
 
-| Tool | What it does | Kimi's reach |
+| | **1 · Propose**<br/>`delegate_to_kimi` | **2 · Apply**<br/>`delegate_and_apply` | **3 · Agent**<br/>`delegate_agentic` |
+|---|---|---|---|
+| **What it does** | Returns code as text | Writes the files, returns a diff | Explores, edits, runs, self-corrects |
+| **Kimi's reach** | Nothing — text only | Writes inside `base_dir` | Shell, `cwd` in the project |
+| **Runs code?** | No | No | **Yes** |
+| **Checks its own work?** | No | No | **Yes — runs the tests** |
+| **Review happens** | Before writing | After, on the diff | After, on the result |
+| **Undo** | Not needed | `git checkout` | `git checkout` |
+| **Typical cost** | ~$0.003 | ~$0.002 | $0.016 – $0.13 |
+
+What each one actually buys you, and what it costs:
+
+| Mode | The advantage | The catch |
 |---|---|---|
-| `delegate_to_kimi` | Returns proposed code as text | Nothing — text only |
-| `delegate_and_apply` | Writes the files, returns a diff | Writes inside one directory |
-| `delegate_agentic` | Explores, edits, runs tests, self-corrects in a loop | Shell, inside one project |
-| `resume_delegation` | Answers a paused agent and resumes it | — it is how *you* reply |
+| **1 · Propose** | **Nothing reaches disk unread.** The only mode with genuine review-before-write | **The most expensive**: applying it means re-emitting the code, so it is billed twice |
+| **2 · Apply** | **82% cheaper on the Claude side** — nothing is re-emitted, only a diff is read. Scales with volume | Review is after the fact. A mistake is already on disk (recoverable via git) |
+| **3 · Agent** | **The only one that closes the loop itself**: writes, runs, sees it fail, fixes. Plays to what K2.7 is built for | 6–40× dearer. Runs real commands. Takes liberties — it once built a 28 MB virtualenv unasked |
+
+`resume_delegation` is not a mode: it is how you answer when mode 3 pauses via
+`ask_claude` for something out of its reach. Its advantage is that the agent
+does not lose the thread — the same session resumes with its context intact.
 
 ---
 
