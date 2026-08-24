@@ -6,6 +6,11 @@ This project has had one user and one real project so far, so "stable" here
 means "its guards are tested and its documented behaviour is true", not
 "battle-tested across many environments".
 
+## Unreleased
+
+- CI actions moved off the deprecated Node 20 runtime (`checkout@v5`,
+  `setup-python@v6`), so a green run comes without a warning attached.
+
 ## 1.0.0 — 2026-08-24
 
 First tagged release. Everything below already existed; the tag exists so there
