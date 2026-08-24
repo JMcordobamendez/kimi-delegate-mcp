@@ -33,6 +33,95 @@ same session resumes with its context intact.
 
 ---
 
+## The agent loop, in plain terms
+
+Modes 1 and 2 are a single exchange: a question goes out, code comes back. Mode
+3 is a conversation, and it is worth picturing before reading the rest of this.
+
+Kimi cannot touch your machine. It has no filesystem and no shell — all it can
+do is *ask*. So this server sits in the middle and runs a loop:
+
+1. It describes the task and offers Kimi four things it may ask for: read a
+   file, list files, write a file, run a shell command.
+2. Kimi answers with a request — *"read `settings.py`"*.
+3. The server carries it out and sends the result back.
+4. Kimi answers with the next one — *"run `pytest -q`"*.
+5. And on it goes, until Kimi replies with an answer instead of a request.
+
+Each of those round trips is one **turn**. Reading a file is a turn. Running the
+tests is a turn. Seeing them fail and writing the fix is two more.
+
+```mermaid
+sequenceDiagram
+    participant C as Claude
+    participant S as This server<br/>on your machine
+    participant K as Kimi<br/>Moonshot API
+
+    C->>S: delegate_agentic(task, base_dir)
+    S->>K: the task, plus the four tools it may ask for
+
+    loop one turn each
+        K->>S: read settings.py
+        S->>K: here it is
+        K->>S: run pytest -q
+        S->>K: 3 failed
+        K->>S: write the fix
+        S->>K: written
+    end
+
+    K->>S: finished, here is what I did
+    S->>C: work log, git diff, and the last test output
+```
+
+A well-specified task takes 6 to 11 turns. One with a lot of trial and error can
+take 40 and still not be finished.
+
+### Why there is a turn budget
+
+`max_turns` caps that loop, at 25 by default. Three reasons it needs one:
+
+**The API has no memory.** Every turn resends the whole conversation so far, so
+turn 40 pays for the 39 before it all over again. Cost does not rise with the
+number of turns, it rises with the *square* of it. Measured on a real project:
+an 11-turn task cost $0.036 and a 45-turn task cost $0.242 — four times the
+turns, seven times the money. (Caching softens this a lot; see
+[Prefix caching](#prefix-caching). It changes the constant, not the shape.)
+
+**A stuck loop looks exactly like a working one.** Models will retry the same
+failing fix with complete conviction. From outside, the only visible difference
+is the bill.
+
+**This is the mode that runs real commands**, unattended, in your project.
+
+So the budget is a fuse. Raising it to something enormous does not make problems
+go away — it removes the one signal that tells you there is a problem.
+
+### What happens as it runs low
+
+A fuse that blew silently, mid-edit, would leave the working tree broken. So the
+budget is a slope, not a cliff:
+
+- **Once a fifth of it is left**, every turn carries a countdown into the
+  conversation — *"3 turns left before you are cut off. Stop opening new fronts.
+  Get what you have already written into a state that compiles and passes."*
+- **On the last turn** it is told to stop calling tools altogether and to
+  summarise instead: what is done, what is left, what it left half-finished.
+- **If it runs out anyway, the run is not lost.** The entire conversation is
+  saved, and the result hands you the line that continues it:
+
+  ```
+  resume_delegation(session_id="d07358a952...", result="<what to finish first>")
+  ```
+
+  `result` is your guidance, not an answer to a question — read the diff first,
+  since a cut-off run may have left something half-written. `extra_turns=N` sets
+  how much more rope it gets; leaving it out grants the same budget it started
+  with.
+
+Continuing is far cheaper than starting over, because a fresh delegation re-pays
+for exploring the project from nothing — and that exploration is most of what
+makes turns expensive in the first place.
+
 ## Requirements
 
 - **Python 3.10+**
