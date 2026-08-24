@@ -19,11 +19,15 @@ import os
 import re
 import subprocess
 import time
-import tomllib
 import uuid
 from difflib import unified_diff
 from pathlib import Path
 from xml.etree import ElementTree
+
+try:  # stdlib from 3.11; this server supports 3.10, which simply skips TOML
+    import tomllib
+except ImportError:  # pragma: no cover - depends on the interpreter running
+    tomllib = None
 
 from mcp.server.mcpserver import MCPServer
 from openai import OpenAI
@@ -164,7 +168,7 @@ def _build_prompt(task: str, file_paths: list[str], extra_context: str) -> str:
         try:
             content = _read_file(fp)
             context_blocks.append(f"### {fp}\n```\n{content}\n```")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - one unreadable context file must not sink the whole delegation
             context_blocks.append(f"### {fp}\n[ERROR reading the file: {e}]")
 
     # Stable first, varying last: file context repeats across delegations over
@@ -392,7 +396,7 @@ def _syntax_error(rel: Path, text: str) -> str:
             return f"  ⚠ {rel}: does not parse — {e}"
         return ""
 
-    if suffix == ".toml":
+    if suffix == ".toml" and tomllib is not None:
         try:
             tomllib.loads(text)
         except tomllib.TOMLDecodeError as e:
@@ -420,7 +424,7 @@ def _resolve_write_path(base: Path, raw: str) -> Path:
     # bare ANSI reset code where the path belonged.
     if not rel:
         raise ValueError(f"path was empty after cleaning: {raw!r}")
-    if rel.startswith("/") or rel.startswith("~"):
+    if rel.startswith(("/", "~")):
         raise ValueError(f"absolute path refused: {rel}")
     target = (base / rel).resolve()
     if not target.is_relative_to(base):
@@ -435,14 +439,14 @@ def _git_summary(base: Path) -> tuple[str, str]:
     try:
         diff = subprocess.run(
             ["git", "-C", str(base), "diff", "--stat"],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, timeout=15, check=False,
         ).stdout.strip()
         untracked = subprocess.run(
             ["git", "-C", str(base), "ls-files", "--others", "--exclude-standard"],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, timeout=15, check=False,
         ).stdout.strip()
         return diff, untracked
-    except Exception:
+    except Exception:  # noqa: BLE001 - reporting what changed is best-effort; never worth raising over
         return "", ""
 
 
@@ -451,13 +455,13 @@ def _git_note(base: Path) -> str:
     try:
         inside = subprocess.run(
             ["git", "-C", str(base), "rev-parse", "--is-inside-work-tree"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=10, check=False,
         )
         if inside.returncode != 0 or inside.stdout.strip() != "true":
             return "⚠ Not a git repo: there is no easy way to undo these changes."
         dirty = subprocess.run(
             ["git", "-C", str(base), "status", "--porcelain"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=10, check=False,
         )
         if dirty.returncode == 0 and dirty.stdout.strip():
             return (
@@ -465,12 +469,18 @@ def _git_note(base: Path) -> str:
                 "Kimi's changes are now mixed in with them."
             )
         return ""
-    except Exception:
+    except Exception:  # noqa: BLE001 - the warning is the product here, so any failure becomes one
         return "⚠ Could not check the git status."
 
 
 @mcp.tool()
-def delegate_to_kimi(task: str, file_paths: list[str] = [], extra_context: str = "") -> str:
+def delegate_to_kimi(
+    task: str,
+    # A None default would make the tool schema Claude sees nullable for no
+    # gain: _build_prompt only ever sorts this list, never mutates it.
+    file_paths: list[str] = [],  # noqa: B006
+    extra_context: str = "",
+) -> str:
     """Delegate a coding task to Kimi K2.7-code and return the proposed code.
 
     Kimi writes nothing: it returns text for you to review and apply with
@@ -501,7 +511,7 @@ def delegate_to_kimi(task: str, file_paths: list[str] = [], extra_context: str =
 def delegate_and_apply(
     task: str,
     base_dir: str,
-    file_paths: list[str] = [],
+    file_paths: list[str] = [],  # noqa: B006 - never mutated, see delegate_to_kimi above
     extra_context: str = "",
 ) -> str:
     """Delegate a task to Kimi and **write the files directly**, returning a diff.
@@ -820,20 +830,27 @@ def _probe_environment(base: Path) -> str:
         try:
             r = subprocess.run(
                 cmd, shell=True, cwd=str(base),
-                capture_output=True, text=True, timeout=20,
+                capture_output=True, text=True, timeout=20, check=False,
             )
             out = (r.stdout or r.stderr).strip()
             return out.splitlines()[0] if out else "no"
-        except Exception:
+        except Exception:  # noqa: BLE001 - probing the environment is best-effort by definition
             return "could not check"
+
+    # These live outside the f-strings on purpose: quotes and backslashes inside
+    # an f-string expression only parse from Python 3.12 (PEP 701), and this
+    # server supports 3.10.
+    one_line = 'tr "\\n" " "'
+    project_files = f"ls requirements*.txt pyproject.toml setup.py package.json Makefile 2>/dev/null | {one_line}"
+    existing_tests = f"ls test_*.py *_test.py tests 2>/dev/null | head -5 | {one_line}"
 
     return (
         "Environment already checked (do not spend turns rediscovering it):\n"
         f"- interpreter: {sh('python3 --version')}\n"
         f"- pytest already installed: {sh('python3 -m pytest --version 2>&1 | head -1')}\n"
         f"- existing venv in the project: {sh('ls -d venv .venv 2>/dev/null | head -1')}\n"
-        f"- project files: {sh('ls requirements*.txt pyproject.toml setup.py package.json Makefile 2>/dev/null | tr \"\\n\" \" \"')}\n"
-        f"- tests already present: {sh('ls test_*.py *_test.py tests 2>/dev/null | head -5 | tr \"\\n\" \" \"')}"
+        f"- project files: {sh(project_files)}\n"
+        f"- tests already present: {sh(existing_tests)}"
     )
 
 
@@ -871,7 +888,7 @@ def _run_agentic_tool(base: Path, name: str, args: dict) -> str:
                 )
             r = subprocess.run(
                 args["command"], shell=True, cwd=str(base),
-                capture_output=True, text=True, timeout=BASH_TIMEOUT,
+                capture_output=True, text=True, timeout=BASH_TIMEOUT, check=False,
             )
             out = (r.stdout or "") + (("\n[stderr]\n" + r.stderr) if r.stderr else "")
             return _clip(f"[exit {r.returncode}]\n{out}".strip(), keep_tail=True)
@@ -879,7 +896,7 @@ def _run_agentic_tool(base: Path, name: str, args: dict) -> str:
         return f"ERROR: unknown tool {name}"
     except subprocess.TimeoutExpired:
         return f"ERROR: the command exceeded {BASH_TIMEOUT}s and was aborted"
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - the model has to SEE failures; raising would end the loop instead
         return f"ERROR: {type(e).__name__}: {e}"
 
 
@@ -932,7 +949,6 @@ def delegate_agentic(
     env_block = _probe_environment(base)
     context = f"{env_block}\n\n{extra_context}" if extra_context else env_block
 
-    client = _client()
     messages: list[dict] = [
         {"role": "system", "content": SYSTEM_PROMPT_AGENTIC},
         {"role": "user", "content": _build_prompt(task, [], context)},
@@ -1131,13 +1147,13 @@ def _drive_agentic_loop(state: dict) -> str:
                 out += ["", "New untracked files:", untracked]
             out += [
                 "",
-                "Check that before answering: if what it is asking for is "
+                ("Check that before answering: if what it is asking for is "
                 "already solved, or if your answer contradicts what it has "
-                "written, tell it so instead of letting it guess.",
+                "written, tell it so instead of letting it guess."),
                 "",
-                "Do what it asks (ask the user first if it involves hardware, "
+                ("Do what it asks (ask the user first if it involves hardware, "
                 "credentials, or anything irreversible) and return the result "
-                "with:",
+                "with:"),
                 "",
                 f'    resume_delegation(session_id="{session_id}", result="...")',
                 "",
@@ -1177,26 +1193,26 @@ def _drive_agentic_loop(state: dict) -> str:
     elif any("run_bash(" in entry for entry in log):
         out += [
             "",
-            "⚠️  It ran commands, but none that look like a test suite or a "
-            "linter. Nothing here has been checked by running it.",
+            ("⚠️  It ran commands, but none that look like a test suite or a "
+            "linter. Nothing here has been checked by running it."),
         ]
     else:
         out += [
             "",
-            "⚠️  It never ran a single command. Agentic mode exists to close "
-            "that loop, so treat this as unverified.",
+            ("⚠️  It never ran a single command. Agentic mode exists to close "
+            "that loop, so treat this as unverified."),
         ]
 
     if cap_session_id:
         budget = state.get("turn_budget", state["max_turns"])
         out += [
             "",
-            "⏱️  It ran out of turns, so the work above may be half-finished — "
+            ("⏱️  It ran out of turns, so the work above may be half-finished — "
             "read the diff before trusting it. Its context is saved, so carrying "
-            "on is far cheaper than starting over:",
+            "on is far cheaper than starting over:"),
             "",
-            f'    resume_delegation(session_id="{cap_session_id}", '
-            'result="<what to finish first>")',
+            (f'    resume_delegation(session_id="{cap_session_id}", '
+            'result="<what to finish first>")'),
             "",
             f"Pass `extra_turns=N` to grant more than the {budget} it started with.",
         ]
@@ -1205,9 +1221,9 @@ def _drive_agentic_loop(state: dict) -> str:
         "---",
         # Cache hits matter most here: every turn resends the whole history, so
         # the repeated prefix is the bulk of what is billed.
-        f"_Kimi K2.7-code · {total_in} tokens in ({total_cached} cached, "
+        (f"_Kimi K2.7-code · {total_in} tokens in ({total_cached} cached, "
         f"{100 * total_cached // max(total_in, 1)}%) / {total_out} out "
-        f"across {len(log)} calls · ~${total_cost:.5f}_",
+        f"across {len(log)} calls · ~${total_cost:.5f}_"),
     ]
     return "\n".join(out)
 

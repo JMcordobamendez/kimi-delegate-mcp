@@ -14,7 +14,7 @@ import sys
 import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-import server  # noqa: E402
+import server
 
 
 @pytest.fixture
@@ -335,7 +335,7 @@ def _session_id_from(out):
 
 
 def test_hitting_the_cap_saves_the_context_instead_of_dropping_it(loop):
-    state, out = loop(3)
+    _state, out = loop(3)
 
     assert "hit the 3-turn cap" in out
     assert "resume_delegation(session_id=" in out
@@ -345,7 +345,7 @@ def test_hitting_the_cap_saves_the_context_instead_of_dropping_it(loop):
 
 
 def test_a_cut_off_run_carries_on_with_a_fresh_budget(loop):
-    state, out = loop(3)
+    _state, out = loop(3)
     sid = _session_id_from(out)
 
     loop.client.finish_after = loop.client.calls + 2
@@ -359,7 +359,7 @@ def test_a_cut_off_run_carries_on_with_a_fresh_budget(loop):
 
 
 def test_extra_turns_overrides_the_default_budget(loop):
-    state, out = loop(3)
+    _state, out = loop(3)
     sid = _session_id_from(out)
 
     server.resume_delegation(session_id=sid, result="carry on", extra_turns=1)
@@ -368,7 +368,7 @@ def test_extra_turns_overrides_the_default_budget(loop):
 
 
 def test_a_session_that_is_not_waiting_for_anything_is_refused(loop, tmp_path):
-    state, out = loop(3)
+    _state, out = loop(3)
     sid = _session_id_from(out)
     # Strip the marker: neither a pending question nor a cut-off run.
     p = server._session_path(sid)
@@ -382,7 +382,7 @@ def test_a_session_that_is_not_waiting_for_anything_is_refused(loop, tmp_path):
 def test_the_warning_counts_down_in_the_model_s_own_conversation(loop):
     # Budget 6 -> threshold max(2, 6//5) = 2. The six turns leave 5,4,3,2,1,0
     # behind them, so the last three are the ones that get warned.
-    state, out = loop(6)
+    state, _out = loop(6)
 
     warnings = [
         m["content"] for m in state["messages"]
@@ -445,7 +445,9 @@ def test_a_plain_missing_path_gets_no_wsl_noise():
 @pytest.mark.parametrize("name,text", [
     ("a.json", '{"a": 1,}'),                       # trailing comma
     ("a.xml", "<a><b></a>"),                       # mismatched tag
-    ("a.toml", "key = "),                          # value missing
+    pytest.param("a.toml", "key = ",               # value missing
+                 marks=pytest.mark.skipif(server.tomllib is None,
+                                          reason="tomllib needs Python 3.11+")),
     ("a.kt", "fun f() {\n    if (x) {\n}\n"),      # one brace short
     ("a.java", "class A { void f() { } } }"),      # one brace too many
     ("a.ts", "const a = [1, 2;"),                  # bracket never closed
@@ -494,7 +496,7 @@ def test_unterminated_literals_are_named(text, expected):
 # --------------------------------------------------------------------------
 
 def test_the_last_verification_comes_back_verbatim(loop):
-    state, out = loop(2, tool=("run_bash", {"command": "echo pytest: 3 passed"}))
+    _state, out = loop(2, tool=("run_bash", {"command": "echo pytest: 3 passed"}))
 
     assert "Last verification it ran, verbatim" in out
     assert "$ echo pytest: 3 passed" in out
@@ -502,13 +504,13 @@ def test_the_last_verification_comes_back_verbatim(loop):
 
 
 def test_commands_that_check_nothing_are_called_out(loop):
-    state, out = loop(2, tool=("run_bash", {"command": "echo hello"}))
+    _state, out = loop(2, tool=("run_bash", {"command": "echo hello"}))
 
     assert "none that look like a test suite" in out
 
 
 def test_a_run_that_never_executed_anything_is_flagged(loop):
-    state, out = loop(2)  # only read_file calls
+    _state, out = loop(2)  # only read_file calls
 
     assert "never ran a single command" in out
 
@@ -546,7 +548,7 @@ def test_a_long_error_is_cut_down_to_a_label():
 
 
 def test_the_log_shows_the_result_beside_the_attempt(loop):
-    state, out = loop(2, tool=("run_bash", {"command": "exit 3"}))
+    _state, out = loop(2, tool=("run_bash", {"command": "exit 3"}))
 
     assert "run_bash(exit 3) → exit 3" in out
 
@@ -554,7 +556,7 @@ def test_the_log_shows_the_result_beside_the_attempt(loop):
 def test_a_stuck_run_is_visible_as_a_repeated_failure(loop):
     # The whole point: the same command failing the same way, over and over,
     # should be readable at a glance without opening anything.
-    state, out = loop(3, tool=("run_bash", {"command": "false"}))
+    _state, out = loop(3, tool=("run_bash", {"command": "false"}))
 
     stuck = [ln for ln in out.splitlines() if ln.endswith("run_bash(false) → exit 1")]
     assert len(stuck) == 3

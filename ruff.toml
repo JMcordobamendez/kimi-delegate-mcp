@@ -1,0 +1,31 @@
+# Lint configuration. The point of pinning a rule set here rather than taking
+# whatever the installed ruff defaults to is that CI and a developer's machine
+# should disagree about nothing.
+
+line-length = 100
+target-version = "py310"   # the oldest interpreter the README promises
+
+[lint]
+# pycodestyle/pyflakes, plus the rule families that catch real defects in this
+# codebase: bugbear, comprehensions, implicit str concat (a missing comma in a
+# list of strings is invisible without it), pylint warnings, and ruff's own.
+select = ["E", "F", "W", "B", "C4", "ISC", "PIE", "PL", "RUF", "BLE", "UP"]
+
+ignore = [
+    # This server's job is to hand a model's output back as text. Long prompt
+    # and message strings are the content, not a style problem.
+    "E501",
+    # Deliberate: the module is one file with sequential sections, and several
+    # functions are long because splitting them would scatter one decision.
+    "PLR0912",  # too many branches
+    "PLR0915",  # too many statements
+    "PLR0913",  # too many arguments
+    "PLR0911",  # too many returns: the dispatch helpers are all early returns
+    # Magic numbers here are token counts, timeouts and prices, all named or
+    # commented where it matters.
+    "PLR2004",
+]
+
+[lint.per-file-ignores]
+# Tests deliberately reach into private helpers: that is what is being tested.
+"tests/*" = ["SLF001"]

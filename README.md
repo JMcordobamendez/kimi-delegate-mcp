@@ -1,5 +1,9 @@
 # kimi-delegate-mcp
 
+[![CI](https://github.com/JMcordobamendez/kimi-delegate-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/JMcordobamendez/kimi-delegate-mcp/actions/workflows/ci.yml)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 An MCP server that lets Claude Code delegate programming work to
 [Kimi K2.7-code](https://platform.kimi.ai) (Moonshot AI) — from generating a
 single file to turning it loose as an autonomous agent that writes code, runs
@@ -671,6 +675,9 @@ Multi-turn tool loops must feed the assistant turn back **including
 ---
 
 ## Tests
+
+They run offline and on every push; see [CHANGELOG.md](CHANGELOG.md) for what
+changed between versions.
 
 The server confines a model's writes and blocks it from publishing, so its
 guards are worth testing. They are:
