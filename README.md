@@ -380,6 +380,25 @@ times commands out at 120 s, clips tool output to 4,000 characters — keeping
 *both ends* for shell output, since test runners put the verdict on the last
 line — and returns `git diff --stat` plus any new untracked files at the end.
 
+**Every call comes back with what it did**, not just what it tried. An attempt
+reads the same whether the agent is converging or going round in circles, so the
+log carries the outcome beside it:
+
+```
+Kimi worked in /path/to/project — 6 tool calls:
+   1. write_file(app/Foo.kt) → 2 lines
+   2. run_bash(gradlew test) → exit 1
+   3. write_file(app/Foo.kt) → 3 lines
+   4. run_bash(gradlew test) → exit 1
+   5. read_file(app/Foo.kt) → 3 lines read
+   6. run_bash(gradlew test) → exit 1
+```
+
+Same file, same command, same failure, three times: that run is stuck, and you
+can see it without opening anything. The log is written by the server from what
+happened — never by the agent about itself, since a summary from a stuck model
+is a claim by the least reliable witness at its least reliable moment.
+
 **The last thing it ran comes back verbatim.** Whatever command looked like a
 test suite or a linter is echoed with its raw output, because "all 14 tests
 pass" is a claim and this is the evidence — and they have differed:
@@ -676,6 +695,7 @@ purpose:
 | Turn-budget warnings | 5 |
 | Fresh budget on resume | 2 |
 | Verification echo | 1 |
+| Outcome labels in the work log | 2 |
 | Windows-path hint on `base_dir` | 5 |
 | `session_id` validation | 8 |
 

@@ -514,6 +514,59 @@ def test_a_run_that_never_executed_anything_is_flagged(loop):
 
 
 # --------------------------------------------------------------------------
+# The work log records outcomes, not just attempts. Three identical commands
+# say nothing; three identical commands all failing say the run is stuck.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("name,result,expected", [
+    ("run_bash", "[exit 0]\nall good", "exit 0"),
+    ("run_bash", "[exit 1]\n3 failed", "exit 1"),
+    ("run_bash", "[exit -9]\nkilled", "exit -9"),          # signals, not just codes
+    ("run_bash", "", "no output"),
+    ("write_file", "OK: wrote a/b.py (19 lines)", "19 lines"),
+    ("write_file", "OK: wrote a/b.py (1 line)", "1 lines"),
+    ("read_file", "one\ntwo\nthree", "3 lines read"),
+    ("list_files", "(no matches)", "no matches"),
+    ("list_files", "a.py\nb.py", "2 files"),
+])
+def test_each_tool_call_says_what_it_did(name, result, expected):
+    assert server._outcome(name, result) == expected
+
+
+@pytest.mark.parametrize("result", [
+    "ERROR: missing.txt does not exist",
+    "REFUSED: commits, pushes and anything that publishes are done by Claude",
+])
+def test_a_refusal_or_error_is_carried_into_the_log(result):
+    assert server._outcome("run_bash", result).startswith(result.split(":")[0])
+
+
+def test_a_long_error_is_cut_down_to_a_label():
+    assert len(server._outcome("read_file", "ERROR: " + "x" * 500)) <= 60
+
+
+def test_the_log_shows_the_result_beside_the_attempt(loop):
+    state, out = loop(2, tool=("run_bash", {"command": "exit 3"}))
+
+    assert "run_bash(exit 3) → exit 3" in out
+
+
+def test_a_stuck_run_is_visible_as_a_repeated_failure(loop):
+    # The whole point: the same command failing the same way, over and over,
+    # should be readable at a glance without opening anything.
+    state, out = loop(3, tool=("run_bash", {"command": "false"}))
+
+    stuck = [ln for ln in out.splitlines() if ln.endswith("run_bash(false) → exit 1")]
+    assert len(stuck) == 3
+
+
+def test_a_tool_with_nothing_to_report_leaves_the_line_bare():
+    # A tool added later, before anyone teaches this function about it: better a
+    # plain line than a dangling arrow with nothing after it.
+    assert server._outcome("some_future_tool", "whatever it returned") == ""
+
+
+# --------------------------------------------------------------------------
 # The prompts sent to the model are English-only; a stray translation would
 # change what the model receives without anyone noticing.
 # --------------------------------------------------------------------------

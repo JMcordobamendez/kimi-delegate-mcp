@@ -950,6 +950,42 @@ _VERIFY_CMD_RE = re.compile(
 )
 
 
+def _outcome(name: str, result: str) -> str:
+    """One short label for what a tool call actually did.
+
+    The work log used to record only the attempt, and an attempt reads exactly
+    the same whether the agent is converging or going round in circles. Three
+    identical `run_bash` lines say nothing; three identical lines all ending
+    `exit 1` say the run is stuck. The result is already in hand at the point
+    the line is written — it just has to be said out loud.
+
+    Written by the server from what happened, never by the agent about itself:
+    a summary from a stuck model is a claim made by the least reliable witness
+    at its least reliable moment.
+    """
+    first = result.splitlines()[0] if result else ""
+    if first.startswith(("ERROR:", "REFUSED:", "ABORTED")):
+        return first[:60]
+
+    if name == "run_bash":
+        m = re.match(r"\[exit (-?\d+)\]", result)
+        return f"exit {m.group(1)}" if m else "no output"
+
+    if name == "write_file":
+        m = re.search(r"\((\d+) lines?\)", first)
+        return f"{m.group(1)} lines" if m else "written"
+
+    if name == "read_file":
+        return f"{len(result.splitlines())} lines read"
+
+    if name == "list_files":
+        if result.strip() == "(no matches)":
+            return "no matches"
+        return f"{len(result.splitlines())} files"
+
+    return ""
+
+
 def _turn_warning(remaining: int, budget: int) -> str:
     """The nudge to inject before a turn, or "" while there is room to work."""
     if remaining == 0:
@@ -1052,7 +1088,9 @@ def _drive_agentic_loop(state: dict) -> str:
                         }
 
             detail = args.get("command") or args.get("path") or args.get("pattern") or ""
-            log.append(f"  {turn:>2}. {name}({detail[:70]})")
+            outcome = _outcome(name, result)
+            line = f"  {turn:>2}. {name}({detail[:70]})"
+            log.append(f"{line} → {outcome}" if outcome else line)
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
         if pending is not None:
