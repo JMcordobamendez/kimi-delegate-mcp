@@ -192,20 +192,38 @@ cost** on a two-file task, and the gap widens on edits to large existing files.
 Review moves from *before* the write to *after* it. Use it on a clean git tree.
 
 Because nothing is executed in this mode, a file that does not even parse would
-otherwise land on disk reported as a success. Every written `.py` file is parsed,
-and anything that fails is flagged prominently:
+otherwise land on disk reported as a success. So every written file is checked
+before the run is allowed to claim success:
 
 ```
 Written in /path/to/project:
   A utils/slug.py (new, 19 lines)
 
-⚠️ **Written but does not parse** — review before trusting it:
+⚠️ **Written but broken** — review before trusting it:
   ⚠ utils/slug.py: does not parse — unmatched '}' (line 19)
 ```
 
 That is a real example: the model emitted an otherwise correct function and
 appended a stray `}`. The file is still written — git remains the undo path —
 but the run cannot pass silently.
+
+| Extension | Check |
+|---|---|
+| `.py` | `ast.parse` |
+| `.json` | `json.loads` |
+| `.xml`, `.svg`, `.xsd`, `.xsl`, `.xslt`, `.plist`, `.pom` | `ElementTree.fromstring` |
+| `.toml` | `tomllib.loads` |
+| `.kt`, `.java`, `.ts`, `.js`, `.go`, `.c`, `.cpp`, `.cs`, `.swift`, `.scala`, `.groovy`, `.php` … | brackets counted, literals and comments skipped |
+| anything else | none |
+
+The bracket count is not a parser and does not pretend to be one. It reports
+only what no valid file can contain — a closer with nothing open, something
+still open at the end, an unterminated string or block comment — and gives up
+silently the moment it meets something it does not model. **Rust is deliberately
+excluded**: a lifetime opens with the same character as a char literal, so
+`fn f<'a>(x: &'a str)` pairs the two apostrophes into a "literal" that swallows
+the `(`. Telling those apart needs a real parser, and `cargo check` is one. A
+checker that cries wolf is one nobody reads.
 
 The model's output is untrusted input — it chooses these paths — so every one is
 resolved and checked before anything is written:
@@ -272,6 +290,23 @@ Other limits: aborts unless the tree is clean, caps the loop at `max_turns`,
 times commands out at 120 s, clips tool output to 4,000 characters — keeping
 *both ends* for shell output, since test runners put the verdict on the last
 line — and returns `git diff --stat` plus any new untracked files at the end.
+
+**The last thing it ran comes back verbatim.** Whatever command looked like a
+test suite or a linter is echoed with its raw output, because "all 14 tests
+pass" is a claim and this is the evidence — and they have differed:
+
+```
+Last verification it ran, verbatim — not its summary of it:
+    $ python -m pytest -q
+    [exit 127]
+
+    [stderr]
+    /bin/sh: 1: python: not found
+```
+
+If it ran commands but never checked anything, or never ran a command at all,
+the result says so instead. Closing that loop is the whole point of this mode,
+so not closing it is worth knowing about.
 
 **The turn cap warns before it bites, and does not end the run.** Once a fifth
 of the budget is left, every turn carries a countdown into the conversation:
@@ -546,7 +581,13 @@ purpose:
 | Command guard (commits/pushes allowed) | 16 |
 | `base_dir` confinement (escapes allowed) | 4 |
 | `finish_reason` check (truncated replies applied) | 1 |
-| Python syntax check | 2 |
+| Syntax checks (Python, JSON, XML, TOML, brackets) | 1–2 each |
+| The bracket scanner's bail-outs (false positives allowed back in) | 1 each |
+| Turn-cap session saving | 4 |
+| Turn-budget warnings | 5 |
+| Fresh budget on resume | 2 |
+| Verification echo | 1 |
+| Windows-path hint on `base_dir` | 5 |
 | `session_id` validation | 8 |
 
 ## Notes on model choice
@@ -579,6 +620,7 @@ is an international transfer to a country with no adequacy decision.
 | `MOONSHOT_API_KEY is not set in the MCP process environment` | Key missing from the registration; re-run `claude mcp add` with `-e` |
 | Edits to `server.py` have no effect | The running session still has the old subprocess — restart |
 | `ABORTED before starting: ...` | Uncommitted changes, often just `__pycache__`. Commit, stash, or gitignore them |
+| `base_dir does not exist ... That is a Windows path` | The server runs inside WSL. Pass the `/mnt/c/...` form it suggests |
 | `ABORTED: Kimi's reply was cut off ... finish_reason='length'` | The task was too big for one reply. Split it up |
 | `No paused delegation with id ...` | The session expired (24 h) or was already resumed. Start a fresh delegation |
 | `(unfinished: hit the N-turn cap)` | Not a dead end: the session is saved. Read the diff, then `resume_delegation(session_id, result="<what to finish first>")` |

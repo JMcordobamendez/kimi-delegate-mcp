@@ -254,16 +254,17 @@ class _FakeFn:
 
 
 class _FakeCall:
-    """A tool call with no side effects: reading a file that is not there."""
-    def __init__(self, i):
+    """A tool call. Defaults to reading a file that is not there, which is the
+    cheapest way to spend a turn without touching anything."""
+    def __init__(self, i, name="read_file", args=None):
         self.id = f"call{i}"
-        self.function = _FakeFn("read_file", json.dumps({"path": "missing.txt"}))
+        self.function = _FakeFn(name, json.dumps(args or {"path": "missing.txt"}))
 
 
 class _FakeTurn:
-    def __init__(self, i):
+    def __init__(self, i, name="read_file", args=None):
         self.content = None
-        self.tool_calls = [_FakeCall(i)]
+        self.tool_calls = [_FakeCall(i, name, args)]
 
     def model_dump(self, exclude_none=True):
         return {"role": "assistant", "content": None}
@@ -289,6 +290,7 @@ class _FakeClient:
     `finish_after` is set, and then it wraps up."""
     def __init__(self, finish_after=None):
         self.seen, self.calls, self.finish_after = [], 0, finish_after
+        self.tool = ("read_file", {"path": "missing.txt"})
         self.chat = self
 
     @property
@@ -300,7 +302,7 @@ class _FakeClient:
         self.calls += 1
         if self.finish_after is not None and self.calls >= self.finish_after:
             return _FakeResp(_FakeFinal("all done"))
-        return _FakeResp(_FakeTurn(self.calls))
+        return _FakeResp(_FakeTurn(self.calls, *self.tool))
 
 
 @pytest.fixture
@@ -310,7 +312,9 @@ def loop(base, tmp_path, monkeypatch):
     client = _FakeClient()
     monkeypatch.setattr(server, "_client", lambda: client)
 
-    def run(max_turns):
+    def run(max_turns, tool=None):
+        if tool:
+            client.tool = tool
         state = {
             "base_dir": str(base),
             "messages": [{"role": "user", "content": "task"}],
@@ -388,6 +392,125 @@ def test_the_warning_counts_down_in_the_model_s_own_conversation(loop):
     assert "2 turns left" in warnings[0]
     assert "1 turns left" in warnings[1]
     assert "LAST turn" in warnings[2]
+
+
+# --------------------------------------------------------------------------
+# base_dir gets Windows paths, because the project lives on C: and this server
+# does not. The rejection should say so instead of just denying the path.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("raw,expected", [
+    (r"C:\Users\josemi\Repos\app", "/mnt/c/Users/josemi/Repos/app"),
+    (r"D:\code", "/mnt/d/code"),
+    ("C:/Users/josemi/app", "/mnt/c/Users/josemi/app"),   # forward slashes too
+    (r'"C:\quoted\path"', "/mnt/c/quoted/path"),
+])
+def test_a_windows_path_is_translated_for_the_hint(raw, expected):
+    assert str(server._wsl_equivalent(raw)) == expected
+
+
+@pytest.mark.parametrize("raw", [
+    "/home/josemi/repo",
+    "~/repo",
+    "relative/path",
+    "",
+])
+def test_a_posix_path_is_not_mistaken_for_a_windows_one(raw):
+    assert server._wsl_equivalent(raw) is None
+
+
+def test_the_rejection_points_at_the_wsl_path_when_that_one_exists(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "_wsl_equivalent", lambda raw: tmp_path)
+    out = server._base_dir_error(r"C:\whatever", pathlib.Path("/nope"))
+    assert "exists and looks like what you meant" in out
+    assert str(tmp_path) in out
+
+
+def test_the_rejection_does_not_promise_a_path_that_is_missing_too():
+    out = server._base_dir_error(r"C:\definitely\not\here", pathlib.Path("/nope"))
+    assert "WSL" in out
+    assert "does not exist either" in out
+
+
+def test_a_plain_missing_path_gets_no_wsl_noise():
+    out = server._base_dir_error("/home/nobody/nothing", pathlib.Path("/home/nobody/nothing"))
+    assert "WSL" not in out
+
+
+# --------------------------------------------------------------------------
+# Syntax checks beyond Python. `delegate_and_apply` runs nothing, so a file
+# that cannot compile is reported as a success unless it is caught here.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("name,text", [
+    ("a.json", '{"a": 1,}'),                       # trailing comma
+    ("a.xml", "<a><b></a>"),                       # mismatched tag
+    ("a.toml", "key = "),                          # value missing
+    ("a.kt", "fun f() {\n    if (x) {\n}\n"),      # one brace short
+    ("a.java", "class A { void f() { } } }"),      # one brace too many
+    ("a.ts", "const a = [1, 2;"),                  # bracket never closed
+    ("a.py", "def f(:\n    pass"),                 # the original check
+])
+def test_broken_files_are_reported(name, text):
+    assert "⚠" in server._syntax_error(pathlib.Path(name), text)
+
+
+@pytest.mark.parametrize("name,text", [
+    ("a.json", '{"a": [1, 2], "b": {"c": null}}'),
+    ("a.xml", "<a><b/></a>"),
+    ("a.toml", '[tool]\nname = "x"'),
+    ("a.kt", 'fun f() {\n    val s = "a } b"\n    // } in a comment\n}'),
+    ("a.kt", 'val s = """\n  { unbalanced inside a raw string\n"""'),
+    ("a.kt", 'val s = "${a.b()} and { }"'),        # string templates
+    ("a.java", "/* } block comment */\nclass A {}"),
+    ("a.go", "func f() {\n\ts := `raw } string`\n}"),
+    ("a.ts", "const re = /[a-z]'/;\nfunction f() {}"),   # bails, says nothing
+    ("a.md", "# a { heading with a brace"),        # not checked at all
+    ("a.txt", "}}}}"),
+    # Rust is not checked at all: lifetimes are indistinguishable from char
+    # literals without a parser, and pretending otherwise cried wolf.
+    ("a.rs", "fn f<'a>(x: &'a str) -> &'a str { x }"),
+    # A double-quoted string running into a newline is a real error in most of
+    # these languages, but it is also what a Rust lifetime or a PHP multi-line
+    # string looks like from here, so the scanner steps back instead.
+    ("a.php", '$s = "line one\nline two";'),
+])
+def test_good_files_are_left_alone(name, text):
+    assert server._syntax_error(pathlib.Path(name), text) == ""
+
+
+@pytest.mark.parametrize("text,expected", [
+    ('fun f() { val s = "never closed', "unterminated string"),
+    ("fun f() { /* never closed\n", "unterminated block comment"),
+    ('val s = """never closed\n', "unterminated raw string"),
+])
+def test_unterminated_literals_are_named(text, expected):
+    assert expected in server._syntax_error(pathlib.Path("a.kt"), text)
+
+
+# --------------------------------------------------------------------------
+# What the agent says it verified, versus what it actually ran. Those have
+# differed, so the raw output of the last check comes back with the summary.
+# --------------------------------------------------------------------------
+
+def test_the_last_verification_comes_back_verbatim(loop):
+    state, out = loop(2, tool=("run_bash", {"command": "echo pytest: 3 passed"}))
+
+    assert "Last verification it ran, verbatim" in out
+    assert "$ echo pytest: 3 passed" in out
+    assert "pytest: 3 passed" in out
+
+
+def test_commands_that_check_nothing_are_called_out(loop):
+    state, out = loop(2, tool=("run_bash", {"command": "echo hello"}))
+
+    assert "none that look like a test suite" in out
+
+
+def test_a_run_that_never_executed_anything_is_flagged(loop):
+    state, out = loop(2)  # only read_file calls
+
+    assert "never ran a single command" in out
 
 
 # --------------------------------------------------------------------------

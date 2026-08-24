@@ -19,9 +19,11 @@ import os
 import re
 import subprocess
 import time
+import tomllib
 import uuid
 from difflib import unified_diff
 from pathlib import Path
+from xml.etree import ElementTree
 
 from mcp.server.mcpserver import MCPServer
 from openai import OpenAI
@@ -201,20 +203,188 @@ def _call_kimi(system_prompt: str, prompt: str) -> tuple[str, str, str]:
     return message, footer, choice.finish_reason or ""
 
 
+# A Windows path is the one wrong answer this argument gets often enough to be
+# worth naming: the project lives on C:, the editor and the build run on
+# Windows, and this server does not — it runs under WSL, where "C:\..." is just
+# a filename that does not exist.
+_WINDOWS_PATH_RE = re.compile(r"^([A-Za-z]):[\\/](.*)$")
+
+
+def _wsl_equivalent(raw: str) -> Path | None:
+    """The /mnt path a Windows path would mean under WSL, or None if it is not one."""
+    if os.name == "nt":
+        return None
+    m = _WINDOWS_PATH_RE.match(raw.strip().strip('"\''))
+    if not m:
+        return None
+    return Path(f"/mnt/{m.group(1).lower()}/{m.group(2).replace(chr(92), '/')}")
+
+
+def _base_dir_error(raw: str, resolved: Path) -> str:
+    """The base_dir rejection, with the WSL translation when that is the bug."""
+    plain = f"ERROR: base_dir does not exist or is not a directory: {resolved}"
+    wsl = _wsl_equivalent(raw)
+    if wsl is None:
+        return plain
+    # Only claim the translation when it is true. A hint that turns out to be
+    # wrong costs more than no hint at all.
+    if wsl.is_dir():
+        return (
+            f"ERROR: base_dir does not exist here: {raw}\n\n"
+            f"That is a Windows path and this server runs inside WSL. This one "
+            f"exists and looks like what you meant:\n\n    {wsl}"
+        )
+    return (
+        f"{plain}\n\n"
+        f"That looks like a Windows path, and this server runs inside WSL, so it "
+        f"needs the /mnt form. {wsl} does not exist either — check the path."
+    )
+
+
+# Languages checked by counting brackets rather than parsing. Kotlin, Java and
+# TypeScript arrive here as often as Python does, and nothing else in this
+# server would notice a file that cannot compile.
+_CFAMILY_SUFFIXES = {
+    ".kt", ".kts", ".java", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
+    ".c", ".h", ".cpp", ".hpp", ".cc", ".cs", ".go", ".swift",
+    ".scala", ".groovy", ".gradle", ".php",
+}
+
+# Rust is deliberately absent. A lifetime opens with the same character as a
+# char literal, so `fn f<'a>(x: &'a str)` pairs the two apostrophes into a
+# "literal" that swallows the '(' and reports a stray ')'. Telling the two apart
+# needs a real parser, and `cargo check` is one.
+
+_BRACKET_PAIRS = {")": "(", "]": "[", "}": "{"}
+
+
+def _unbalanced_brackets(text: str) -> str:
+    """Walk C-family source ignoring literals, and report a bracket that cannot match.
+
+    Deliberately not a parser. It reports only what no valid file can contain —
+    a closer with nothing open, something still open at the end, an unterminated
+    string or block comment — and gives up silently the moment it meets
+    something it does not model, such as a regex literal. A checker that cries
+    wolf is one nobody reads, so the bias is heavily towards saying nothing.
+    """
+    stack: list[tuple[str, int]] = []
+    line, i, n = 1, 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == "\n":
+            line += 1
+            i += 1
+            continue
+
+        if text[i:i + 2] == "//":
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+            continue
+
+        if text[i:i + 2] == "/*":
+            j = text.find("*/", i + 2)
+            if j < 0:
+                return f"unterminated block comment opened on line {line}"
+            line += text.count("\n", i, j)
+            i = j + 2
+            continue
+
+        # Raw strings (Kotlin, Scala, Groovy) hold whatever they like, braces
+        # included, so they have to be skipped whole.
+        if text[i:i + 3] == '"""':
+            j = text.find('"""', i + 3)
+            if j < 0:
+                return f"unterminated raw string opened on line {line}"
+            line += text.count("\n", i, j)
+            i = j + 3
+            continue
+
+        if c in "\"'`":
+            j, opened_at = i + 1, line
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == c:
+                    break
+                if text[j] == "\n" and c != "`":
+                    # A bare newline inside a one-line literal means this is
+                    # something we do not model (a regex literal, say). Stop
+                    # rather than report a bracket count we no longer trust.
+                    return ""
+                j += 1
+            if j >= n:
+                return f"unterminated string opened on line {opened_at}"
+            line += text.count("\n", i, j)
+            i = j + 1
+            continue
+
+        if c in "([{":
+            stack.append((c, line))
+        elif c in ")]}":
+            if not stack:
+                return f"stray '{c}' on line {line} with nothing open"
+            opener, opened_at = stack.pop()
+            if opener != _BRACKET_PAIRS[c]:
+                return (
+                    f"'{c}' on line {line} does not close "
+                    f"'{opener}' from line {opened_at}"
+                )
+        i += 1
+
+    if stack:
+        opener, opened_at = stack[-1]
+        return f"'{opener}' opened on line {opened_at} is never closed"
+    return ""
+
+
 def _syntax_error(rel: Path, text: str) -> str:
-    """Report a Python file that does not even parse.
+    """Report a written file that is obviously broken, before anyone trusts it.
 
     `delegate_and_apply` has no execution step, so nothing else would notice: a
     single stray character makes the module unimportable and the run still
     reports success. Seen for real — the model appended a lone '}' after an
     otherwise correct function.
+
+    Where a stdlib parser exists the check is exact. Where it does not, brackets
+    are counted instead, which catches the shape of that same failure without
+    dragging in a compiler per language.
     """
-    if rel.suffix != ".py":
+    suffix = rel.suffix.lower()
+
+    if suffix == ".py":
+        try:
+            ast.parse(text)
+        except SyntaxError as e:
+            return f"  ⚠ {rel}: does not parse — {e.msg} (line {e.lineno})"
         return ""
-    try:
-        ast.parse(text)
-    except SyntaxError as e:
-        return f"  ⚠ {rel}: does not parse — {e.msg} (line {e.lineno})"
+
+    if suffix == ".json":
+        try:
+            json.loads(text)
+        except json.JSONDecodeError as e:
+            return f"  ⚠ {rel}: does not parse — {e.msg} (line {e.lineno})"
+        return ""
+
+    if suffix in {".xml", ".svg", ".xsd", ".xsl", ".xslt", ".plist", ".pom"}:
+        try:
+            ElementTree.fromstring(text)
+        except ElementTree.ParseError as e:
+            return f"  ⚠ {rel}: does not parse — {e}"
+        return ""
+
+    if suffix == ".toml":
+        try:
+            tomllib.loads(text)
+        except tomllib.TOMLDecodeError as e:
+            return f"  ⚠ {rel}: does not parse — {e}"
+        return ""
+
+    if suffix in _CFAMILY_SUFFIXES:
+        note = _unbalanced_brackets(text)
+        if note:
+            return f"  ⚠ {rel}: {note}"
+
     return ""
 
 
@@ -336,7 +506,7 @@ def delegate_and_apply(
     """
     base = Path(base_dir).expanduser().resolve()
     if not base.is_dir():
-        return f"ERROR: base_dir does not exist or is not a directory: {base}"
+        return _base_dir_error(base_dir, base)
 
     git_note = _git_note(base)
 
@@ -411,7 +581,7 @@ def delegate_and_apply(
     if broken:
         out += [
             "",
-            "⚠️ **Written but does not parse** — review before trusting it:",
+            "⚠️ **Written but broken** — review before trusting it:",
             *broken,
         ]
     if git_note:
@@ -726,7 +896,7 @@ def delegate_agentic(
     """
     base = Path(base_dir).expanduser().resolve()
     if not base.is_dir():
-        return f"ERROR: base_dir does not exist or is not a directory: {base}"
+        return _base_dir_error(base_dir, base)
 
     note = _git_note(base)
     if note:
@@ -768,6 +938,18 @@ def delegate_agentic(
 # that did not compile — worse than one that stopped cleanly, because the tree
 # is left broken and the caller has to finish it by hand. Telling the model how
 # much rope is left lets it land the plane.
+# What counts as the agent checking its own work. The point is not to be
+# exhaustive: it is to find the one command whose raw output settles whether the
+# run succeeded, so the summary is not the only evidence on offer.
+_VERIFY_CMD_RE = re.compile(
+    r"\b(pytest|unittest\b|tox\b|nox\b"
+    r"|npm\s+(run\s+)?test|yarn\s+test|pnpm\s+test|jest\b|vitest\b"
+    r"|go\s+test|cargo\s+(test|clippy|check)|mvn\b|gradlew?\b|sbt\b"
+    r"|make\s+(test|check)|ctest\b|rspec\b|phpunit\b"
+    r"|ruff\b|flake8\b|mypy\b|pyright\b|eslint\b|tsc\b|clippy\b)"
+)
+
+
 def _turn_warning(remaining: int, budget: int) -> str:
     """The nudge to inject before a turn, or "" while there is room to work."""
     if remaining == 0:
@@ -861,6 +1043,13 @@ def _drive_agentic_loop(state: dict) -> str:
                     )
                 else:
                     result = _run_agentic_tool(base, name, args)
+                    # Keep the raw output of whatever last checked the work. The
+                    # agent's prose about it has been wrong before; this has not.
+                    if name == "run_bash" and _VERIFY_CMD_RE.search(args.get("command", "")):
+                        state["last_verification"] = {
+                            "command": args["command"],
+                            "output": result,
+                        }
 
             detail = args.get("command") or args.get("path") or args.get("pattern") or ""
             log.append(f"  {turn:>2}. {name}({detail[:70]})")
@@ -920,6 +1109,29 @@ def _drive_agentic_loop(state: dict) -> str:
         out += ["", "git diff --stat:", diff]
     if untracked:
         out += ["", "New untracked files:", untracked]
+
+    # "All 14 tests pass" is a claim; this is the evidence. They have differed.
+    checked = state.get("last_verification")
+    if checked:
+        out += [
+            "",
+            "Last verification it ran, verbatim — not its summary of it:",
+            f"    $ {checked['command']}",
+            *[f"    {ln}" for ln in checked["output"].splitlines()],
+        ]
+    elif any("run_bash(" in entry for entry in log):
+        out += [
+            "",
+            "⚠️  It ran commands, but none that look like a test suite or a "
+            "linter. Nothing here has been checked by running it.",
+        ]
+    else:
+        out += [
+            "",
+            "⚠️  It never ran a single command. Agentic mode exists to close "
+            "that loop, so treat this as unverified.",
+        ]
+
     if cap_session_id:
         budget = state.get("turn_budget", state["max_turns"])
         out += [
