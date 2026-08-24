@@ -29,6 +29,25 @@ from mcp.server.mcpserver import MCPServer
 from openai import OpenAI
 
 MODEL = "kimi-k2.7-code"
+
+# Moonshot's list price, in dollars per million tokens. Every cost this server
+# reports — and the economics written up in the README — comes from these three
+# numbers, so they live here once and nowhere else. Nothing checks them against
+# Moonshot: a price change makes every figure quietly wrong, which is worse than
+# reporting nothing at all, because these are read and trusted.
+# Recorded 2026-08-24.
+PRICE_IN_PER_M = 0.95      # prompt tokens billed fresh
+PRICE_CACHED_PER_M = 0.19  # prompt tokens served from the prefix cache
+PRICE_OUT_PER_M = 4.00     # completion tokens, reasoning included
+
+
+def _cost(prompt_tokens: int, cached: int, completion_tokens: int) -> float:
+    """Dollars for one API call. The only place this arithmetic lives."""
+    return (
+        (prompt_tokens - cached) * PRICE_IN_PER_M
+        + cached * PRICE_CACHED_PER_M
+        + completion_tokens * PRICE_OUT_PER_M
+    ) / 1e6
 BASE_URL = "https://api.moonshot.ai/v1"
 
 MAX_DIFF_LINES = 120
@@ -56,8 +75,9 @@ TESTABILITY_RULE = (
     "dependencies that cannot be substituted."
 )
 
-# Kimi caches by *prefix*: identical leading tokens are billed at $0.19/M
-# instead of $0.95/M. So everything stable must come first and the varying
+# Kimi caches by *prefix*: identical leading tokens bill at the cached rate
+# instead of the fresh one (see the price constants above — roughly a fifth).
+# So everything stable must come first and the varying
 # task must come last, or the prefix diverges on the first request and
 # nothing is ever cached. These system prompts are byte-for-byte identical on
 # every call, so they always head the cacheable prefix.
@@ -192,8 +212,7 @@ def _call_kimi(system_prompt: str, prompt: str) -> tuple[str, str, str]:
         reasoning = (getattr(ctd, "reasoning_tokens", 0) or 0) if ctd else 0
         # Reported so cache behaviour and thinking overhead can be verified
         # rather than assumed.
-        billed_in = usage.prompt_tokens - cached
-        cost = (billed_in * 0.95 + cached * 0.19 + usage.completion_tokens * 4.00) / 1e6
+        cost = _cost(usage.prompt_tokens, cached, usage.completion_tokens)
         think = f", {reasoning} reasoning" if reasoning else ""
         footer = (
             f"_Kimi K2.7-code · {usage.prompt_tokens} tokens in "
@@ -1042,9 +1061,7 @@ def _drive_agentic_loop(state: dict) -> str:
         if u:
             ptd = getattr(u, "prompt_tokens_details", None)
             cached = (getattr(ptd, "cached_tokens", 0) or 0) if ptd else 0
-            totals["cost"] += (
-                (u.prompt_tokens - cached) * 0.95 + cached * 0.19 + u.completion_tokens * 4.00
-            ) / 1e6
+            totals["cost"] += _cost(u.prompt_tokens, cached, u.completion_tokens)
             totals["in"] += u.prompt_tokens
             totals["out"] += u.completion_tokens
             totals["cached"] += cached

@@ -141,6 +141,13 @@ Billing is pay-as-you-go: $0.95 per million input tokens ($0.19 cached), $4.00
 per million output. A small delegation costs well under a cent; the loops in
 `delegate_agentic` run to a few cents. A few dollars of credit goes a long way.
 
+> Those three figures, and every cost quoted further down, are a snapshot taken
+> on 2026-08-24. The copy the server actually bills against lives in
+> `PRICE_IN_PER_M`, `PRICE_CACHED_PER_M` and `PRICE_OUT_PER_M` at the top of
+> `server.py`, and nothing checks either copy against Moonshot. If the prices
+> move, change the constants first — the numbers this tool reports are read and
+> trusted, so a wrong one is worse than none.
+
 > **Never put the key in this repository.** It is passed as an environment
 > variable at registration time (step 3) and stored in Claude Code's own
 > config, outside the repo. `.gitignore` already excludes `.env` and key files,
@@ -696,6 +703,7 @@ purpose:
 | Fresh budget on resume | 2 |
 | Verification echo | 1 |
 | Outcome labels in the work log | 2 |
+| Prices declared once (a literal re-added by hand) | 1 |
 | Windows-path hint on `base_dir` | 5 |
 | `session_id` validation | 8 |
 

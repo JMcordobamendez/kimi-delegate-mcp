@@ -567,6 +567,48 @@ def test_a_tool_with_nothing_to_report_leaves_the_line_bare():
 
 
 # --------------------------------------------------------------------------
+# Prices. Every cost this server reports comes from three numbers, and a
+# duplicated copy of one of them is a copy that goes stale in silence.
+# --------------------------------------------------------------------------
+
+def test_the_cost_of_a_call_is_what_the_price_list_says():
+    # 1M prompt tokens, none cached, plus 1M completion tokens.
+    assert server._cost(1_000_000, 0, 1_000_000) == pytest.approx(0.95 + 4.00)
+
+
+def test_cached_prompt_tokens_are_billed_at_the_cached_rate():
+    # The same million tokens in, entirely served from the prefix cache.
+    assert server._cost(1_000_000, 1_000_000, 0) == pytest.approx(0.19)
+
+
+def test_nothing_used_costs_nothing():
+    assert server._cost(0, 0, 0) == 0.0
+
+
+def test_the_prices_appear_exactly_once_in_the_source():
+    """A second copy of a price is one nobody remembers to update."""
+    tree = ast.parse(pathlib.Path(server.__file__).read_text())
+    prices = {server.PRICE_IN_PER_M, server.PRICE_CACHED_PER_M, server.PRICE_OUT_PER_M}
+
+    # The module-level constants are the one place they are allowed to be.
+    declared = {
+        id(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+    }
+
+    stray = [
+        n.value
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Constant)
+        and isinstance(n.value, float)
+        and n.value in prices
+        and id(n) not in declared
+    ]
+    assert not stray, f"price literals repeated outside the constants: {stray}"
+
+
+# --------------------------------------------------------------------------
 # The prompts sent to the model are English-only; a stray translation would
 # change what the model receives without anyone noticing.
 # --------------------------------------------------------------------------
