@@ -26,9 +26,10 @@ What each one actually buys you, and what it costs:
 | **2 · Apply** | **82% cheaper on the Claude side** — nothing is re-emitted, only a diff is read. Scales with volume | Review is after the fact. A mistake is already on disk (recoverable via git) |
 | **3 · Agent** | **The only one that closes the loop itself**: writes, runs, sees it fail, fixes. Plays to what K2.7 is built for | 6–40× dearer. Runs real commands. Takes liberties — it once built a 28 MB virtualenv unasked |
 
-`resume_delegation` is not a mode: it is how you answer when mode 3 pauses via
-`ask_claude` for something out of its reach. Its advantage is that the agent
-does not lose the thread — the same session resumes with its context intact.
+`resume_delegation` is not a mode: it is how you pick mode 3 back up, either
+when it pauses via `ask_claude` for something out of its reach or when it runs
+out of turns. Its advantage is that the agent does not lose the thread — the
+same session resumes with its context intact.
 
 ---
 
@@ -272,12 +273,27 @@ times commands out at 120 s, clips tool output to 4,000 characters — keeping
 *both ends* for shell output, since test runners put the verdict on the last
 line — and returns `git diff --stat` plus any new untracked files at the end.
 
+**The turn cap warns before it bites, and does not end the run.** Once a fifth
+of the budget is left, every turn carries a countdown into the conversation:
+
+```
+TURN BUDGET: 3 turns left before you are cut off. Stop opening new fronts. Get
+what you have already written into a state that compiles and passes, then
+summarise.
+```
+
+and the final turn is told not to call any more tools. Without that the loop
+just stopped mid-edit — the failure that prompted this was a run that hit the
+cap having written a test file that did not compile, leaving the tree broken.
+If it is cut off anyway, the session is saved exactly as a pause is, and the
+result tells you how to continue rather than making you start over.
+
 **Expect it to take liberties.** In testing it created a 28 MB virtualenv inside
 the project, unprompted, to install pytest after the system one was missing.
 That was reasonable and it got the tests passing — but review the directory, not
 just the diff.
 
-### `resume_delegation(session_id, result)`
+### `resume_delegation(session_id, result, extra_turns=0)`
 
 Confined to one directory and barred from committing, the agent would otherwise
 have no way to handle work that needs the outside world — flashing a board,
@@ -289,6 +305,14 @@ loop**: state is written to `~/.cache/kimi-delegate/sessions/`, and the request
 comes back to you along with the work so far and the diff. Do the thing, then
 call `resume_delegation` with what you observed — the same session continues
 with its context intact.
+
+The same door reopens a run that hit `max_turns`. There is no question to answer
+there, so `result` is guidance instead — what to finish first, what to leave
+alone — and `extra_turns` sets how much more rope it gets, defaulting to the
+budget it started with. Read the diff before you write that guidance: a cut-off
+run can have left something half-written. Continuing costs a fraction of a fresh
+delegation, which would re-pay for exploring the project from scratch — and that
+exploration is most of what makes turns expensive.
 
 ```mermaid
 flowchart TD
@@ -557,6 +581,8 @@ is an international transfer to a country with no adequacy decision.
 | `ABORTED before starting: ...` | Uncommitted changes, often just `__pycache__`. Commit, stash, or gitignore them |
 | `ABORTED: Kimi's reply was cut off ... finish_reason='length'` | The task was too big for one reply. Split it up |
 | `No paused delegation with id ...` | The session expired (24 h) or was already resumed. Start a fresh delegation |
+| `(unfinished: hit the N-turn cap)` | Not a dead end: the session is saved. Read the diff, then `resume_delegation(session_id, result="<what to finish first>")` |
+| `that session is not waiting for an answer` | The run neither paused nor ran out of turns, so there is nothing to resume |
 
 ## License
 

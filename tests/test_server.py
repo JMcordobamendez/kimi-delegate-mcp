@@ -230,6 +230,167 @@ def test_agentic_refuses_a_non_git_directory(base):
 
 
 # --------------------------------------------------------------------------
+# Running out of turns. The loop used to stop dead and throw the context away:
+# the tree was left half-edited and the retry re-paid for the exploration, which
+# is what makes turns expensive. It now warns the model on the way down and
+# saves what it had so the run can be picked up.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("remaining,budget,expected", [
+    (20, 25, ""),                 # plenty of room, say nothing
+    (6, 25, ""),                  # still above the fifth
+    (5, 25, "5 turns left"),      # a fifth of the budget left
+    (1, 25, "1 turns left"),
+    (0, 25, "LAST turn"),
+    (2, 4, "2 turns left"),       # tiny budgets keep a floor of 2
+])
+def test_the_agent_is_told_when_it_is_running_out(remaining, budget, expected):
+    assert expected in server._turn_warning(remaining, budget)
+
+
+class _FakeFn:
+    def __init__(self, name, arguments):
+        self.name, self.arguments = name, arguments
+
+
+class _FakeCall:
+    """A tool call with no side effects: reading a file that is not there."""
+    def __init__(self, i):
+        self.id = f"call{i}"
+        self.function = _FakeFn("read_file", json.dumps({"path": "missing.txt"}))
+
+
+class _FakeTurn:
+    def __init__(self, i):
+        self.content = None
+        self.tool_calls = [_FakeCall(i)]
+
+    def model_dump(self, exclude_none=True):
+        return {"role": "assistant", "content": None}
+
+
+class _FakeFinal:
+    def __init__(self, text):
+        self.content, self.tool_calls = text, []
+
+    def model_dump(self, exclude_none=True):
+        return {"role": "assistant", "content": self.content}
+
+
+class _FakeResp:
+    def __init__(self, message):
+        self.choices = [type("Choice", (), {"message": message})()]
+        self.usage = None
+
+
+class _FakeClient:
+    """Stands in for the OpenAI client. Keeps asking for one more tool call, so
+    the only way the loop can end is by exhausting its budget — unless
+    `finish_after` is set, and then it wraps up."""
+    def __init__(self, finish_after=None):
+        self.seen, self.calls, self.finish_after = [], 0, finish_after
+        self.chat = self
+
+    @property
+    def completions(self):
+        return self
+
+    def create(self, *, model, messages, **kw):
+        self.seen.append([dict(m) for m in messages])
+        self.calls += 1
+        if self.finish_after is not None and self.calls >= self.finish_after:
+            return _FakeResp(_FakeFinal("all done"))
+        return _FakeResp(_FakeTurn(self.calls))
+
+
+@pytest.fixture
+def loop(base, tmp_path, monkeypatch):
+    """Drive the agentic loop offline, with sessions kept out of the real cache."""
+    monkeypatch.setattr(server, "SESSION_DIR", tmp_path / "sessions")
+    client = _FakeClient()
+    monkeypatch.setattr(server, "_client", lambda: client)
+
+    def run(max_turns):
+        state = {
+            "base_dir": str(base),
+            "messages": [{"role": "user", "content": "task"}],
+            "log": [],
+            "totals": {"in": 0, "out": 0, "cached": 0, "cost": 0.0},
+            "turns_used": 0,
+            "max_turns": max_turns,
+            "turn_budget": max_turns,
+        }
+        return state, server._drive_agentic_loop(state)
+
+    run.client = client
+    return run
+
+
+def _session_id_from(out):
+    return out.split('session_id="')[1].split('"')[0]
+
+
+def test_hitting_the_cap_saves_the_context_instead_of_dropping_it(loop):
+    state, out = loop(3)
+
+    assert "hit the 3-turn cap" in out
+    assert "resume_delegation(session_id=" in out
+    # The id it prints has to be a session that actually exists, or the advice
+    # is a dead end.
+    assert server._session_path(_session_id_from(out)).is_file()
+
+
+def test_a_cut_off_run_carries_on_with_a_fresh_budget(loop):
+    state, out = loop(3)
+    sid = _session_id_from(out)
+
+    loop.client.finish_after = loop.client.calls + 2
+    resumed = server.resume_delegation(session_id=sid, result="fix the test file first")
+
+    assert "all done" in resumed
+    assert loop.client.calls > 3                      # it really kept going
+    assert not server._session_path(sid).is_file()    # and the file is consumed
+    # The guidance has to reach the model, not just the log.
+    assert any("fix the test file first" in str(m) for m in loop.client.seen[-1])
+
+
+def test_extra_turns_overrides_the_default_budget(loop):
+    state, out = loop(3)
+    sid = _session_id_from(out)
+
+    server.resume_delegation(session_id=sid, result="carry on", extra_turns=1)
+
+    assert loop.client.calls == 4  # 3 before the cap, exactly 1 granted
+
+
+def test_a_session_that_is_not_waiting_for_anything_is_refused(loop, tmp_path):
+    state, out = loop(3)
+    sid = _session_id_from(out)
+    # Strip the marker: neither a pending question nor a cut-off run.
+    p = server._session_path(sid)
+    saved = json.loads(p.read_text())
+    saved.pop("out_of_turns")
+    p.write_text(json.dumps(saved))
+
+    assert "not waiting for an answer" in server.resume_delegation(session_id=sid, result="x")
+
+
+def test_the_warning_counts_down_in_the_model_s_own_conversation(loop):
+    # Budget 6 -> threshold max(2, 6//5) = 2. The six turns leave 5,4,3,2,1,0
+    # behind them, so the last three are the ones that get warned.
+    state, out = loop(6)
+
+    warnings = [
+        m["content"] for m in state["messages"]
+        if m.get("role") == "user" and str(m.get("content", "")).startswith("TURN BUDGET:")
+    ]
+    assert len(warnings) == 3
+    assert "2 turns left" in warnings[0]
+    assert "1 turns left" in warnings[1]
+    assert "LAST turn" in warnings[2]
+
+
+# --------------------------------------------------------------------------
 # The prompts sent to the model are English-only; a stray translation would
 # change what the model receives without anyone noticing.
 # --------------------------------------------------------------------------

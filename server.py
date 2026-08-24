@@ -720,7 +720,9 @@ def delegate_agentic(
         task: the goal, with its "done" criterion (e.g. "until pytest passes").
         base_dir: the project root. Must be a git repo with no pending changes.
         extra_context: additional free-text context.
-        max_turns: iteration cap, so a loop cannot run away.
+        max_turns: iteration cap, so a loop cannot run away. Hitting it is
+            not the end of the road: the context is saved and
+            `resume_delegation` picks the run up with a fresh budget.
     """
     base = Path(base_dir).expanduser().resolve()
     if not base.is_dir():
@@ -754,8 +756,33 @@ def delegate_agentic(
         "totals": {"in": 0, "out": 0, "cached": 0, "cost": 0.0},
         "turns_used": 0,
         "max_turns": max_turns,
+        # `max_turns` grows when a cut-off run is resumed; this one does not, so
+        # the warning window stays the same size on every stretch.
+        "turn_budget": max_turns,
     }
     return _drive_agentic_loop(state)
+
+
+# The loop used to just stop when it ran out of turns, mid-whatever it was
+# doing. Observed failure: a run that hit the cap having written a test file
+# that did not compile — worse than one that stopped cleanly, because the tree
+# is left broken and the caller has to finish it by hand. Telling the model how
+# much rope is left lets it land the plane.
+def _turn_warning(remaining: int, budget: int) -> str:
+    """The nudge to inject before a turn, or "" while there is room to work."""
+    if remaining == 0:
+        return (
+            "TURN BUDGET: this is your LAST turn. Do not start anything new and "
+            "do not call any more tools. Reply with a summary of what is done, "
+            "what is left, and anything you left half-finished."
+        )
+    if remaining <= max(2, budget // 5):
+        return (
+            f"TURN BUDGET: {remaining} turns left before you are cut off. Stop "
+            "opening new fronts. Get what you have already written into a state "
+            "that compiles and passes, then summarise."
+        )
+    return ""
 
 
 def _drive_agentic_loop(state: dict) -> str:
@@ -770,10 +797,19 @@ def _drive_agentic_loop(state: dict) -> str:
     totals = state["totals"]
     client = _client()
     final = ""
+    cap_session_id = ""
 
     while state["turns_used"] < state["max_turns"]:
         state["turns_used"] += 1
         turn = state["turns_used"]
+
+        # Turns left AFTER this one. Inside the danger zone the count goes into
+        # every turn: the pressure is meant to rise, and a single warning eight
+        # turns back is one the model has stopped acting on.
+        remaining = state["max_turns"] - state["turns_used"]
+        warning = _turn_warning(remaining, state.get("turn_budget", state["max_turns"]))
+        if warning:
+            messages.append({"role": "user", "content": warning})
 
         resp = client.chat.completions.create(
             model=MODEL,
@@ -865,6 +901,11 @@ def _drive_agentic_loop(state: dict) -> str:
             ]
             return "\n".join(out)
     else:
+        # Save it here too, not only on a pause. Without this the whole context
+        # is thrown away and the next attempt re-pays the exploration, which is
+        # exactly what makes the turns expensive in the first place.
+        state["out_of_turns"] = True
+        cap_session_id = _save_session(state)
         final = f"(unfinished: hit the {state['max_turns']}-turn cap)"
 
     total_in, total_out = totals["in"], totals["out"]
@@ -879,6 +920,19 @@ def _drive_agentic_loop(state: dict) -> str:
         out += ["", "git diff --stat:", diff]
     if untracked:
         out += ["", "New untracked files:", untracked]
+    if cap_session_id:
+        budget = state.get("turn_budget", state["max_turns"])
+        out += [
+            "",
+            "⏱️  It ran out of turns, so the work above may be half-finished — "
+            "read the diff before trusting it. Its context is saved, so carrying "
+            "on is far cheaper than starting over:",
+            "",
+            f'    resume_delegation(session_id="{cap_session_id}", '
+            'result="<what to finish first>")',
+            "",
+            f"Pass `extra_turns=N` to grant more than the {budget} it started with.",
+        ]
     out += [
         "",
         "---",
@@ -892,8 +946,8 @@ def _drive_agentic_loop(state: dict) -> str:
 
 
 @mcp.tool()
-def resume_delegation(session_id: str, result: str) -> str:
-    """Answer an `ask_claude` and resume the paused delegation.
+def resume_delegation(session_id: str, result: str, extra_turns: int = 0) -> str:
+    """Pick a delegation back up — after it asked for something, or ran out of turns.
 
     Kimi pauses when it needs something beyond its reach — flashing an ESP32,
     reading a serial port, looking at an LED, touching something outside the
@@ -904,9 +958,17 @@ def resume_delegation(session_id: str, result: str) -> str:
     visible. If you could not do it, say so anyway and explain why — that lets
     Kimi try another route instead of waiting.
 
+    A run cut off by `max_turns` resumes through here too. There is no question
+    to answer in that case, so `result` is guidance instead: what to finish
+    first, what to leave alone. Look at the diff before writing it — a cut-off
+    run can have left something half-written.
+
     Args:
-        session_id: the id the pause returned.
+        session_id: the id the pause, or the turn-cap message, returned.
         result: what you observed, verbatim. Also the place to say it failed.
+            For a cut-off run, the guidance to carry on with.
+        extra_turns: how many turns to add. 0 gives a cut-off run the same
+            budget it started with, and leaves a paused one untouched.
     """
     try:
         state = _load_session(session_id)
@@ -914,12 +976,27 @@ def resume_delegation(session_id: str, result: str) -> str:
         return f"ERROR: {e}"
 
     call_id = state.pop("pending_tool_call_id", None)
-    if not call_id:
+    if call_id:
+        state["messages"].append(
+            {"role": "tool", "tool_call_id": call_id, "content": result}
+        )
+        if extra_turns > 0:
+            state["max_turns"] += extra_turns
+    elif state.pop("out_of_turns", False):
+        # A cut-off run has no unanswered tool call, and no turns left to spend:
+        # granting the budget IS the resumption, and `result` steers it.
+        budget = state.get("turn_budget", state["max_turns"])
+        state["max_turns"] += extra_turns if extra_turns > 0 else budget
+        state["messages"].append({
+            "role": "user",
+            "content": (
+                f"You were cut off by the turn cap. You now have "
+                f"{state['max_turns'] - state['turns_used']} more turns. Check "
+                f"what you left half-finished before carrying on.\n\n{result}"
+            ),
+        })
+    else:
         return "ERROR: that session is not waiting for an answer."
-
-    state["messages"].append(
-        {"role": "tool", "tool_call_id": call_id, "content": result}
-    )
 
     # Drop the saved copy now: from here the run either finishes or suspends
     # again under a fresh id, and a stale file would invite a double resume.
